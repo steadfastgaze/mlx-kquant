@@ -155,6 +155,196 @@ def test_gather_qmm_sorted_rejects_non_transpose():
         mx.eval(out)
 
 
+# ---------------------------------------------------------------------------
+# Fused gate/up + SwiGLU: gather_qmm_sorted_swiglu
+# ---------------------------------------------------------------------------
+#
+# The fused op runs the sorted segment GEMM against a combined [2N, K]
+# gate/up expert stack and applies the DSV4 SwiGLU in the kernel epilogue on
+# the float32 accumulators. Parity against the unfused composition
+# (gather_qmm_sorted, then the SwiGLU formula in float32) holds only to a
+# tolerance: the epilogue's exp() differs from the host implementation, and
+# for half-precision I/O the unfused composition rounds the gate/up GEMM
+# outputs through the I/O dtype while the fused epilogue reads the unrounded
+# accumulators. The bounds below sit ~4x above the measured worst case per
+# dtype.
+
+# The active limit must clip the test data (gate/up products at the
+# 0.1-scale inputs reach ~0.3), asserted per case so the two limit arms are
+# proven to differ; the large limit never clips, which is also asserted.
+SWIGLU_LIMIT_ACTIVE = 0.2
+SWIGLU_LIMIT_OFF = 1e6
+
+# (rtol, atol) per I/O dtype for fused-vs-unfused parity.
+SWIGLU_TOLS = {
+    mx.float16: (1e-2, 1.2e-3),
+    mx.bfloat16: (5e-2, 1e-2),
+    mx.float32: (2e-6, 2e-7),
+}
+
+# Combined experts are expensive to mint (E quantize calls of [2N, K]) and
+# shared by every fused parametrization, so cache them per codec.
+_COMBINED_EXPERTS_CACHE: dict = {}
+
+
+def _build_combined_experts(codec):
+    """Quantize E random combined gate/up matrices [2N, K] (gate rows first)
+    into stacked wire bytes, plus their f32 dequantized forms."""
+    if codec not in _COMBINED_EXPERTS_CACHE:
+        rng = np.random.default_rng(3)
+        imat = None
+        if codec in REQ_IMAT:
+            imat = mx.array(
+                (np.abs(rng.standard_normal(K)) + 0.1).astype(np.float32))
+        scales = mx.zeros((1,), dtype=mx.uint8)
+        wq_list = []
+        deq_list = []
+        for _ in range(E):
+            w_np = (rng.standard_normal((2 * N, K)) * 0.1).astype(np.float32)
+            wq, _ = kq.quantize(mx.array(w_np), codec, imatrix=imat)
+            mx.eval(wq)
+            wq_np = np.ascontiguousarray(np.array(wq).astype(np.uint8))
+            wq_list.append(wq_np)
+            deq_list.append(
+                np.array(
+                    kq.dequantize(mx.array(wq_np), scales, codec, mx.float32)))
+        _COMBINED_EXPERTS_CACHE[codec] = (np.stack(wq_list), deq_list)
+    wq_stack, deq_list = _COMBINED_EXPERTS_CACHE[codec]
+    return mx.array(wq_stack), deq_list
+
+
+def _swiglu_f32(combined_f32, limit):
+    """The jang _dsv4_swiglu formula in float32 numpy: gate is the first N
+    columns, up the last N; a positive limit clamps gate from above only and
+    up symmetrically, then silu(gate) * up."""
+    gate = combined_f32[:, :N].copy()
+    up = combined_f32[:, N:].copy()
+    if limit > 0:
+        up = np.clip(up, -limit, limit)
+        gate = np.minimum(gate, limit)
+    return gate / (1.0 + np.exp(-gate)) * up
+
+
+@pytest.mark.parametrize("codec", CODECS)
+@pytest.mark.parametrize(
+    "case", ["ragged", "single_row_segments", "expert_gaps"])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
+def test_gather_qmm_sorted_swiglu_matches_unfused(codec, case, dtype):
+    """Fused output matches gather_qmm_sorted on the combined stack followed
+    by the SwiGLU formula in float32, at both an active and an effectively
+    disabled clamp. Case coverage: ragged (counts 90 and 250 cross every
+    shipped BM row-chunk boundary), single-row segments, and expert gaps
+    (empty threadgroups in the E-wide grid)."""
+    rng = np.random.default_rng(1)
+    w, _deq = _build_combined_experts(codec)
+    scales = mx.zeros((1,), dtype=mx.uint8)
+
+    ids_np, _seg, x_np, S = _spec_arrays(SEGMENT_CASES[case], rng)
+    x = mx.array(x_np).astype(dtype)
+    ids = mx.array(ids_np)
+
+    comb = kq.gather_qmm_sorted(x, w, scales, codec, ids)
+    mx.eval(comb)
+    comb_f32 = np.array(comb.astype(mx.float32))
+    rtol, atol = SWIGLU_TOLS[dtype]
+
+    for limit in (SWIGLU_LIMIT_ACTIVE, SWIGLU_LIMIT_OFF):
+        got = kq.gather_qmm_sorted_swiglu(
+            x, w, scales, codec, ids, N, limit)
+        mx.eval(got)
+        assert got.dtype == dtype
+        assert got.shape == (S, N)
+
+        clips = bool(
+            ((comb_f32[:, :N] > limit)
+             | (np.abs(comb_f32[:, N:]) > limit)).any())
+        if limit == SWIGLU_LIMIT_ACTIVE:
+            assert clips, f"{codec} {case}: active limit clipped nothing"
+        else:
+            assert not clips, f"{codec} {case}: 'off' limit clipped data"
+
+        ref = _swiglu_f32(comb_f32, limit)
+        np.testing.assert_allclose(
+            np.array(got.astype(mx.float32)),
+            ref,
+            rtol=rtol,
+            atol=atol,
+            err_msg=f"{codec} {case} {dtype} limit={limit}",
+        )
+
+
+@pytest.mark.parametrize("codec", CODECS)
+def test_gather_qmm_sorted_swiglu_matches_dq_f32_reference(codec):
+    """One independent semantic reference so a bug shared with
+    gather_qmm_sorted cannot pass the parity check by matching itself: the
+    per-expert f32 dequantize + f32 GEMM loop with the SwiGLU formula in
+    numpy, at the tight f32-x bound."""
+    rng = np.random.default_rng(1)
+    w, deq = _build_combined_experts(codec)
+    scales = mx.zeros((1,), dtype=mx.uint8)
+
+    ids_np, seg_np, x_np, S = _spec_arrays(SEGMENT_CASES["ragged"], rng)
+    x = mx.array(x_np)  # float32
+
+    got = kq.gather_qmm_sorted_swiglu(
+        x, w, scales, codec, mx.array(ids_np), N, SWIGLU_LIMIT_ACTIVE)
+    mx.eval(got)
+    assert got.dtype == mx.float32
+    g = np.array(got)
+
+    comb = np.zeros((S, 2 * N), dtype=np.float32)
+    for expert, start, count in seg_np:
+        comb[start : start + count] = (
+            x_np[start : start + count] @ deq[expert].T)
+    ref = _swiglu_f32(comb, SWIGLU_LIMIT_ACTIVE)
+
+    diff = np.abs(g - ref)
+    max_rel = float((diff / (np.abs(ref) + 1e-3)).max())
+    max_abs = float(diff.max())
+    assert max_rel < 1e-3 or max_abs < 1e-4, (
+        f"{codec}: dq_f32 parity max_rel={max_rel:.3e} max_abs={max_abs:.3e}"
+    )
+
+
+def test_gather_qmm_sorted_swiglu_rejects_bad_gate_out():
+    """w must hold exactly 2 * gate_out rows per expert."""
+    rng = np.random.default_rng(2)
+    wq, _ = kq.quantize(
+        mx.array((rng.standard_normal((N, K)) * 0.1).astype(np.float32)),
+        "q2_k",
+    )
+    mx.eval(wq)
+    w = mx.array(np.stack([np.array(wq).astype(np.uint8)]))  # N rows, not 2N
+    x = mx.array((rng.standard_normal((3, K)) * 0.1).astype(np.float32))
+    ids = mx.array(np.zeros(3, dtype=np.uint32))
+    scales = mx.zeros((1,), dtype=mx.uint8)
+    with pytest.raises(ValueError):
+        kq.gather_qmm_sorted_swiglu(x, w, scales, "q2_k", ids, N, 0.2)
+    with pytest.raises(ValueError):
+        kq.gather_qmm_sorted_swiglu(x, w, scales, "q2_k", ids, 0, 0.2)
+    with pytest.raises(ValueError):
+        kq.gather_qmm_sorted_swiglu(
+            x, w, scales, "q2_k", ids, N // 2, 0.2, transpose=False)
+
+
+def test_gather_qmm_sorted_swiglu_rejects_bad_ids():
+    rng = np.random.default_rng(2)
+    wq, _ = kq.quantize(
+        mx.array((rng.standard_normal((2 * N, K)) * 0.1).astype(np.float32)),
+        "q2_k",
+    )
+    mx.eval(wq)
+    w = mx.array(np.stack([np.array(wq).astype(np.uint8)]))
+    x = mx.array((rng.standard_normal((3, K)) * 0.1).astype(np.float32))
+    scales = mx.zeros((1,), dtype=mx.uint8)
+    with pytest.raises(ValueError):
+        kq.gather_qmm_sorted_swiglu(
+            x, w, scales, "q2_k", mx.array(np.zeros(3, dtype=np.int32)), N, 0.2)
+    with pytest.raises(ValueError):
+        kq.gather_qmm_sorted_swiglu(
+            x, w, scales, "q2_k", mx.array(np.zeros(4, dtype=np.uint32)), N, 0.2)
+
+
 def test_gather_qmm_sorted_rejects_bad_ids():
     rng = np.random.default_rng(2)
     wq, _ = kq.quantize(

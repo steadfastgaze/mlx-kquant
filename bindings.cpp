@@ -666,6 +666,59 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "gather_qmm_sorted_swiglu",
+      &mlx_kquant::gather_qmm_sorted_swiglu,
+      "x"_a,
+      "w"_a,
+      "scales"_a,
+      "kquant_type"_a,
+      "sorted_ids"_a,
+      "gate_out"_a,
+      "swiglu_limit"_a,
+      "transpose"_a = true,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Fused gate/up + SwiGLU sorted-ids segmented (mixture-of-experts)
+        quantized GEMM for combined gate/up weights: gather_qmm_sorted over a
+        [2 * gate_out, K] expert stack with the SwiGLU applied in the kernel
+        epilogue, so the [S, 2 * gate_out] intermediate is never materialized.
+
+        For each row ``s`` with expert id ``sorted_ids[s]``:
+        ``gate = x[s] @ dequant(w[e])[0:gate_out].T``, ``up = x[s] @
+        dequant(w[e])[gate_out:].T``, and the output row is
+        ``silu(gate) * up`` computed in float32, with ``swiglu_limit > 0``
+        clamping ``gate`` from above only and ``up`` symmetrically first.
+
+        Args:
+            x (array): float16/bfloat16/float32 activations [S, K],
+                row-contiguous. The sorted token-expert pair rows.
+            w (array): uint8 K-quant wire bytes shaped
+                (n_experts, 2 * gate_out, bytes_per_row); each expert stacks
+                its gate rows first, then its up rows.
+            scales (array): vestigial placeholder; ignored by the kernel.
+            kquant_type (str): codec name, e.g. ``"iq2_xxs"``, ``"q2_k"``.
+            sorted_ids (array): device uint32 [S] expert index per x row,
+                ascending (equal ids contiguous), values in [0, n_experts).
+                Same contract as gather_qmm_sorted.
+            gate_out (int): output features of the gate half; w must hold
+                exactly ``2 * gate_out`` rows per expert.
+            swiglu_limit (float): activation clamp. Positive values clamp the
+                gate to at most ``swiglu_limit`` and the up value to
+                ``[-swiglu_limit, swiglu_limit]`` before ``silu(gate) * up``;
+                values <= 0 disable the clamps.
+            transpose (bool): must be True (only the MoE transpose shape is
+                supported).
+
+        Returns:
+            array: the fused result [S, gate_out] (x.dtype). The GEMMs and
+            the activation compute in float32; against the unfused
+            gather_qmm_sorted + activation composition the result is
+            numerically equivalent but not bit-identical, because the fused
+            epilogue skips the intermediate store in x.dtype.
+      )");
+
+  m.def(
       "quantize",
       &mlx_kquant::quantize,
       "w"_a,

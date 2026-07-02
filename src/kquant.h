@@ -144,6 +144,32 @@ mx::array gather_qmm_sorted(
     bool transpose = true,
     mx::StreamOrDevice s = {});
 
+// Fused gate/up + SwiGLU variant of gather_qmm_sorted for combined gate/up
+// MoE weights. `w` holds each expert's [2 * gate_out, K] stack (gate rows
+// first, then up rows), so w.shape(-2) must equal 2 * gate_out. For each row
+// s with expert id sorted_ids[s], the kernel computes gate = x[s] @
+// dequant(w[e])[0:gate_out].T and up = x[s] @ dequant(w[e])[gate_out:].T on
+// float32 accumulators and stores activation(gate, up) as the I/O dtype,
+// yielding [S, gate_out]. The activation is the DSV4 SwiGLU: with
+// swiglu_limit > 0 the gate clamps from above only (min(gate, limit)) and up
+// clamps symmetrically (clamp(up, -limit, limit)); then silu(gate) * up,
+// all in float32. swiglu_limit <= 0 disables the clamps. The epilogue reads
+// the float32 accumulators directly, so against the unfused compose
+// (gather_qmm_sorted, then the activation on its stored output) the result
+// is numerically equivalent but not bit-identical for half-precision I/O.
+// Everything else (shapes, dtypes, sorted-ids contract) matches
+// gather_qmm_sorted. Metal-only.
+mx::array gather_qmm_sorted_swiglu(
+    mx::array x,
+    mx::array w,
+    mx::array scales,
+    const std::string& kquant_type,
+    mx::array sorted_ids,
+    int gate_out,
+    float swiglu_limit,
+    bool transpose = true,
+    mx::StreamOrDevice s = {});
+
 // Vector scaled-dot-product attention for large head dims (e.g. 512) that stock
 // MLX's fused vector allowlist {64,96,128,256} excludes. q/k/v are float
 // [B, n_q_heads, qL, D] / [B, n_kv_heads, kL, D] (GQA: n_q_heads % n_kv_heads
@@ -959,6 +985,50 @@ class KQuantGatherQMMSorted : public mx::Primitive {
   std::string kquant_type_;
   int group_size_;
   int bits_;
+};
+
+// Fused gate/up + SwiGLU sorted-ids segmented (MoE) quantized GEMM: the
+// KQuantGatherQMMSorted dispatch shape with a combined [2 * gate_out, K]
+// expert weight stack and a float32 SwiGLU epilogue. Inference-only:
+// jvp/vjp/vmap inherit the base-class throwing defaults. eval_cpu throws
+// (Metal-only kernel).
+class KQuantGatherQMMSortedSwiglu : public mx::Primitive {
+ public:
+  explicit KQuantGatherQMMSortedSwiglu(
+      mx::Stream stream,
+      std::string kquant_type,
+      int group_size,
+      int bits,
+      int gate_out,
+      float swiglu_limit)
+      : mx::Primitive(stream),
+        kquant_type_(std::move(kquant_type)),
+        group_size_(group_size),
+        bits_(bits),
+        gate_out_(gate_out),
+        swiglu_limit_(swiglu_limit) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantGatherQMMSortedSwiglu";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  std::string kquant_type_;
+  int group_size_;
+  int bits_;
+  int gate_out_;
+  float swiglu_limit_;
 };
 
 // Gather (MoE) quantized matmul. vjp implements only the gradient wrt x (a

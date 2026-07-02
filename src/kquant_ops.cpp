@@ -608,6 +608,115 @@ mx::array gather_qmm_sorted(
       {std::move(x_c), std::move(w_c), std::move(scales), std::move(ids_c)});
 }
 
+mx::array gather_qmm_sorted_swiglu(
+    mx::array x,
+    mx::array w,
+    mx::array scales,
+    const std::string& kquant_type,
+    mx::array sorted_ids,
+    int gate_out,
+    float swiglu_limit,
+    bool transpose,
+    mx::StreamOrDevice s_) {
+  if (!transpose) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmm_sorted_swiglu] only transpose=True is "
+        "supported (the MoE weight layout [n_experts, N, bytes_per_row]).");
+  }
+  if (w.dtype() != mx::uint8) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmm_sorted_swiglu] w must be uint8 (raw GGUF "
+        "wire bytes).");
+  }
+  const KQuantCodec* codec = codec_by_name(kquant_type);
+  if (codec == nullptr) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmm_sorted_swiglu] Unknown kquant_type: '" +
+        kquant_type + "'.");
+  }
+  auto dt = x.dtype();
+  if (dt != mx::float16 && dt != mx::bfloat16 && dt != mx::float32) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmm_sorted_swiglu] x must be float16, bfloat16, "
+        "or float32.");
+  }
+  if (x.ndim() != 2) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmm_sorted_swiglu] x must be 2-D [S, K] but "
+        << "got shape " << x.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (w.ndim() != 3) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmm_sorted_swiglu] w must be 3-D "
+        << "[n_experts, 2 * gate_out, bytes_per_row] but got shape "
+        << w.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (sorted_ids.dtype() != mx::uint32) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmm_sorted_swiglu] sorted_ids must be uint32.");
+  }
+  if (sorted_ids.ndim() != 1 || sorted_ids.shape(0) != x.shape(0)) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmm_sorted_swiglu] sorted_ids must be 1-D "
+        << "with one id per x row (" << x.shape(0) << ") but got shape "
+        << sorted_ids.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (gate_out <= 0 || w.shape(-2) != 2 * gate_out) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmm_sorted_swiglu] w must stack gate rows "
+        << "then up rows per expert: expected " << 2 * gate_out
+        << " rows for gate_out " << gate_out << " but w has " << w.shape(-2)
+        << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  // Expand w's quantized geometry from the codec block layout, exactly as
+  // gather_qmm_sorted does.
+  int w_bytes_per_row = w.shape(-1);
+  if (w_bytes_per_row % codec->bytes_per_block != 0) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmm_sorted_swiglu] KQuant weight last dim ("
+        << w_bytes_per_row << " bytes) is not a whole number of "
+        << codec->bytes_per_block << "-byte " << codec->name << " blocks.";
+    throw std::invalid_argument(msg.str());
+  }
+  int K = (w_bytes_per_row / codec->bytes_per_block) * codec->weights_per_block;
+  if (K != x.shape(-1)) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmm_sorted_swiglu] x last dim (" << x.shape(-1)
+        << ") does not match the expanded quantized weight inner dim (" << K
+        << ") for codec '" << codec->name << "'.";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto s = mx::to_stream(s_);
+
+  // Row-contiguize x / w / sorted_ids at the op level so eval_gpu can assume
+  // dense inputs, exactly as gather_qmm_sorted does.
+  auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
+  auto w_c = w.flags().row_contiguous ? w : mx::contiguous(w, false, s);
+  auto ids_c = sorted_ids.flags().row_contiguous
+      ? sorted_ids
+      : mx::contiguous(sorted_ids, false, s);
+
+  mx::Shape out_shape = {x.shape(0), gate_out};
+
+  return mx::array(
+      std::move(out_shape),
+      dt,
+      std::make_shared<KQuantGatherQMMSortedSwiglu>(
+          s,
+          kquant_type,
+          codec->weights_per_block,
+          codec->bits,
+          gate_out,
+          swiglu_limit),
+      {std::move(x_c), std::move(w_c), std::move(scales), std::move(ids_c)});
+}
+
 std::vector<mx::array> quantize(
     const mx::array& w,
     const std::string& kquant_type,

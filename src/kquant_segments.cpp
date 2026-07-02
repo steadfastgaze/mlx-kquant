@@ -77,6 +77,25 @@ int kq_seg_tile_bn(const std::string& tile) {
   return BN;
 }
 
+// Tile for the fused gate/up + SwiGLU sorted kernel, selected independently
+// of KQ_SEG_TILE because the fused kernel instantiates its own tile set: two
+// float32 accumulator tiles double the per-thread accumulator registers
+// against the plain kernel at the same BN, so the plain default's BN=128
+// does not carry over. The default t48x64x16a (device-A body, both weight
+// tiles unpadded [BN, BK], 8 KB threadgroup footprint) measured fastest on
+// a sorted MoE bulk-prefill shape (S=12288, K=4096, gate_out=4096, E=16,
+// iq2_xxs, f16 x, medians of 5): 93.9 ms against 98.7 ms for t32x64x16a and
+// 129.0 ms for t48x128x16a, whose doubled accumulator set at BN=128 spills;
+// the unfused gather_qmm_sorted + elementwise SwiGLU compose measured
+// 105-107 ms on the same shape. KQ_SEG_SWIGLU_TILE overrides for A/Bs.
+const std::string& kq_seg_swiglu_tile() {
+  static const std::string tile = []() {
+    const char* e = std::getenv("KQ_SEG_SWIGLU_TILE");
+    return std::string(e != nullptr ? e : "t48x64x16a");
+  }();
+  return tile;
+}
+
 } // namespace
 
 std::vector<mx::Shape> KQuantGatherQMMSegments::output_shapes(
@@ -244,6 +263,92 @@ void KQuantGatherQMMSorted::eval_cpu(
     std::vector<mx::array>&) {
   throw std::runtime_error(
       "[mlx_kquant.gather_qmm_sorted] has no CPU implementation.");
+}
+
+std::vector<mx::Shape> KQuantGatherQMMSortedSwiglu::output_shapes(
+    const std::vector<mx::array>& inputs) {
+  const auto& x = inputs[0];
+  return {mx::Shape{x.shape(0), gate_out_}};
+}
+
+bool KQuantGatherQMMSortedSwiglu::is_equivalent(
+    const mx::Primitive& other) const {
+  const auto& o = static_cast<const KQuantGatherQMMSortedSwiglu&>(other);
+  return kquant_type_ == o.kquant_type_ && group_size_ == o.group_size_ &&
+      bits_ == o.bits_ && gate_out_ == o.gate_out_ &&
+      swiglu_limit_ == o.swiglu_limit_;
+}
+
+#ifdef _METAL_
+
+void KQuantGatherQMMSortedSwiglu::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  auto& out = outputs[0];
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+
+  // inputs: x (float16/bfloat16/float32, row-contiguous [S, K]), w (uint8
+  // [E, 2 * gate_out, bytes_per_row], gate rows then up rows per expert),
+  // scales (vestigial placeholder), sorted_ids (uint32 [S], ascending). The
+  // dispatch mirrors KQuantGatherQMMSorted with the grid width sized by
+  // gate_out (the fused output width) and the SwiGLU limit passed as a
+  // kernel constant.
+  const auto& x = inputs[0];
+  const auto& w = inputs[1];
+
+  int S = x.shape(0);
+  int K = x.shape(1);
+  int E = w.shape(0);
+  int N = gate_out_;
+
+  const std::string& tile = kq_seg_swiglu_tile();
+  int BN = kq_seg_tile_bn(tile);
+  constexpr int WM = 2, WN = 2;
+  constexpr int TG_THREADS = WM * WN * 32;
+
+  // Grid: one threadgroup per (n-tile, expert). Threadgroups whose expert has
+  // no rows exit after the binary search.
+  MTL::Size group_dims(TG_THREADS, 1, 1);
+  MTL::Size grid_dims((N + BN - 1) / BN, E, 1);
+
+  std::string type_string = kq_type_string(x.dtype());
+  std::string kname = kq_kname_prefix(kquant_type_) +
+      "gather_qmm_sorted_swiglu_" + type_string + "_" + tile;
+
+  auto kernel = kq_get_kernel(d, kname);
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+
+  int c = 0;
+  ce.set_input_array(w, c++);
+  ce.set_input_array(x, c++);
+  ce.set_input_array(inputs[3], c++); // sorted_ids
+  ce.set_output_array(out, c++);
+  ce.set_bytes(K, c++);
+  ce.set_bytes(N, c++);
+  ce.set_bytes(S, c++);
+  ce.set_bytes(swiglu_limit_, c++);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+#else // !_METAL_
+
+void KQuantGatherQMMSortedSwiglu::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.gather_qmm_sorted_swiglu] requires a Metal build.");
+}
+
+#endif
+
+void KQuantGatherQMMSortedSwiglu::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.gather_qmm_sorted_swiglu] has no CPU implementation.");
 }
 
 } // namespace mlx_kquant

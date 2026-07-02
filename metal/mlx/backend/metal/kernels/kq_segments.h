@@ -478,6 +478,255 @@ METAL_FUNC uint kq_sorted_lower_bound(
   return lo;
 }
 
+// Paired device-A MMA for the fused gate/up SwiGLU kernel: one shared A
+// fragment set (KqSegDevAMMA's device-row loads), one B fragment register
+// set reused for both weight tiles, and two float32 accumulator tiles
+// (Cg for the gate rows, Cu for the up rows). Each k-step loads the A
+// fragments once, multiplies them against the staged gate tile into Cg,
+// reloads the B fragments from the staged up tile, and multiplies into Cu.
+// Per output element each accumulator sees the same k-order call sequence
+// as KqSegDevAMMA, so each half matches the plain kernel's float32
+// accumulation exactly; only the epilogue differs.
+//
+// The epilogue applies the DSV4 SwiGLU in float32 on the raw accumulators:
+// with limit c > 0, gate g clamps from above only (g = min(g, c)) and up u
+// clamps symmetrically (u = clamp(u, -c, c)); then silu(g) * u, cast to the
+// I/O type T at store. This is the jang _dsv4_swiglu contract (clamp applied
+// for any strictly positive limit); the DS4-c Metal epilogue uses the same
+// one-sided gate / symmetric up clamps but arms them at c > 1e-6, so the two
+// agree for any limit at or above 1e-6. Because the activation reads the
+// float32 accumulators directly, the fused output skips the round-trip
+// through T that the unfused compose (GEMM store, then activation) takes, so
+// half-precision I/O parity is close but not bit-identical.
+template <typename T, int BM, int BN, int BK, int WM, int WN, typename StageT>
+struct KqSegDevAPairMMA {
+  STEEL_CONST short kFragSize = 8;
+  using MMAFrag_acc_t = mlx::steel::BaseMMAFrag<float, 8, 8>;
+
+  STEEL_CONST short TM_stride = kFragSize * WM;
+  STEEL_CONST short TN_stride = kFragSize * WN;
+  STEEL_CONST short TM = BM / (kFragSize * WM);
+  STEEL_CONST short TN = BN / (kFragSize * WN);
+
+  // Both weight tiles are unpadded [BN rows of n, BK cols of k]
+  // (transpose_b=true), the KqSegDevAMMA layout.
+  STEEL_CONST short B_str_k = 1;
+  STEEL_CONST short B_str_n = BK;
+  STEEL_CONST short tile_stride_b = kFragSize * B_str_k;
+
+  mlx::steel::MMATile<float, TM, 1, MMAFrag_acc_t> Atile;
+  mlx::steel::MMATile<float, 1, TN, MMAFrag_acc_t> Btile;
+  mlx::steel::MMATile<float, TM, TN, MMAFrag_acc_t> Cg;
+  mlx::steel::MMATile<float, TM, TN, MMAFrag_acc_t> Cu;
+
+  short sm;
+  short sn;
+  short Bs_offset;
+
+  METAL_FUNC KqSegDevAPairMMA(ushort simd_group_id, ushort simd_lane_id) {
+    short tm = kFragSize * (simd_group_id / WN);
+    short tn = kFragSize * (simd_group_id % WN);
+
+    short2 simd_coord = MMAFrag_acc_t::get_coord(simd_lane_id);
+    sm = simd_coord.y;
+    sn = simd_coord.x;
+
+    Bs_offset = (sm)*B_str_k + (tn + sn) * B_str_n;
+
+    sm += tm;
+    sn += tn;
+  }
+
+  // One (BM, BK) x (BK, BN) step against both staged weight tiles. A
+  // fragments load from device rows exactly as KqSegDevAMMA::mma_device_a
+  // (rows past num_rows read as zero); the single Btile register set is
+  // loaded twice per k-fragment, once per weight tile.
+  METAL_FUNC void mma_device_a_pair(
+      const device T* x_tile,
+      const int ld,
+      const int k0,
+      const short num_rows,
+      const threadgroup StageT* Bg,
+      const threadgroup StageT* Bu) {
+    Bg += Bs_offset;
+    Bu += Bs_offset;
+
+    STEEL_PRAGMA_UNROLL
+    for (short kk = 0; kk < BK; kk += kFragSize) {
+      simdgroup_barrier(mem_flags::mem_none);
+
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < TM; ++i) {
+        const short row = sm + i * TM_stride;
+        thread auto& frag = Atile.frag_at(i, 0);
+        if (row < num_rows) {
+          const device T* src =
+              x_tile + static_cast<int64_t>(row) * ld + k0 + kk + (sn % 8);
+          frag[0] = static_cast<float>(src[0]);
+          frag[1] = static_cast<float>(src[1]);
+        } else {
+          frag[0] = 0.0f;
+          frag[1] = 0.0f;
+        }
+      }
+
+      simdgroup_barrier(mem_flags::mem_none);
+
+      Btile.template load<StageT, 1, WN, B_str_k, B_str_n>(Bg);
+
+      simdgroup_barrier(mem_flags::mem_none);
+
+      mlx::steel::tile_matmad(Cg, Atile, Btile, Cg);
+
+      Btile.template load<StageT, 1, WN, B_str_k, B_str_n>(Bu);
+
+      simdgroup_barrier(mem_flags::mem_none);
+
+      mlx::steel::tile_matmad(Cu, Atile, Btile, Cu);
+
+      Bg += tile_stride_b;
+      Bu += tile_stride_b;
+    }
+  }
+
+  // Fused SwiGLU epilogue in float32 over the accumulator fragments (see the
+  // struct comment for the clamp contract). The result lands in Cg, which
+  // the store methods then write out.
+  METAL_FUNC void apply_swiglu(const float limit) {
+    thread float* g = Cg.elems();
+    thread float* u = Cu.elems();
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < decltype(Cg)::kElemsPerTile; ++i) {
+      float gate = g[i];
+      float up = u[i];
+      if (limit > 0.0f) {
+        gate = metal::min(gate, limit);
+        up = metal::clamp(up, -limit, limit);
+      }
+      g[i] = (gate / (1.0f + metal::exp(-gate))) * up;
+    }
+  }
+
+  METAL_FUNC void store_result(device T* D, const int ldd) {
+    D += sm * ldd + sn;
+    Cg.template store<T, WM, WN>(D, ldd);
+  }
+
+  METAL_FUNC void
+  store_result_safe(device T* D, const int ldd, short2 dst_tile_dims) {
+    D += sm * ldd + sn;
+    dst_tile_dims -= short2(sn, sm);
+    if (dst_tile_dims.x <= 0 || dst_tile_dims.y <= 0) {
+      return;
+    }
+    Cg.template store_safe<T, WM, WN>(D, ldd, dst_tile_dims);
+  }
+};
+
+// Fused gate/up + SwiGLU segment-span GEMM on the paired device-A MMA. The
+// expert weight matrix is the combined [2N, K] gate/up stack: rows [0, N)
+// are the gate projection and rows [N, 2N) the up projection. Each k-step
+// stages one gate tile and one up tile (both unpadded [BN, BK], the same
+// per-thread decode assignment as the plain deva body applied to each half),
+// multiplies both against shared activation fragments, and the epilogue
+// stores activation(gate, up) as [row_count, N] instead of the [row_count,
+// 2N] concatenation the unfused pair produces.
+template <
+    typename T,
+    typename Codec,
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN,
+    typename StageT>
+METAL_FUNC void kq_segment_span_gemm_swiglu_deva(
+    const device uint8_t* w,
+    const device T* x,
+    device T* out,
+    const int K,
+    const int N, // gate rows per expert; the combined weight holds 2N rows
+    const float swiglu_limit,
+    const uint expert,
+    const uint row_start,
+    const uint row_count,
+    const int n_tile,
+    threadgroup StageT* Wg,
+    threadgroup StageT* Wu,
+    uint lid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int TG_THREADS = WM * WN * 32;
+  constexpr int chpb = Codec::superblock / 16;
+
+  const short num_outs = min(BN, N - n_tile);
+  const int nb = K / Codec::superblock;
+  const int row_bytes = nb * Codec::block_bytes;
+  const device uint8_t* w_expert =
+      w + static_cast<int64_t>(expert) * 2 * N * row_bytes;
+
+  for (uint r0 = 0; r0 < row_count; r0 += BM) {
+    const short num_rows = min((int)BM, (int)(row_count - r0));
+    const device T* x_tile = x + static_cast<int64_t>(row_start + r0) * K;
+
+    KqSegDevAPairMMA<T, BM, BN, BK, WM, WN, StageT> mma_op(simd_gid, simd_lid);
+
+    for (int k0 = 0; k0 < K; k0 += BK) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      // Decode both halves' weight tiles in one cooperative pass: chunk ids
+      // [0, BN*wcols16) fill the gate tile from weight rows n_tile + wr and
+      // [BN*wcols16, 2*BN*wcols16) fill the up tile from rows N + n_tile +
+      // wr. Within each half the (row, chunk) assignment matches the plain
+      // deva body.
+      constexpr int wcols16 = BK / 16;
+      constexpr int wchunks = 2 * BN * wcols16;
+      for (int c = lid; c < wchunks; c += TG_THREADS) {
+        const int upper = c / (BN * wcols16); // 0 = gate rows, 1 = up rows
+        const int ch = c % (BN * wcols16);
+        const int wr = ch / wcols16;
+        const int wc16 = ch % wcols16;
+        float4x4 reg;
+        if (wr < num_outs) {
+          const int n = upper * N + n_tile + wr;
+          const int k = k0 + wc16 * 16;
+          const int ich = k / 16;
+          const int ib = ich / chpb;
+          const int cch = ich % chpb;
+          const device uint8_t* block = w_expert +
+              static_cast<int64_t>(n) * row_bytes +
+              static_cast<int64_t>(ib) * Codec::block_bytes;
+          Codec::deq_chunk16(block, cch, reg);
+        } else {
+#pragma unroll
+          for (int i = 0; i < 16; ++i) {
+            reg[i / 4][i % 4] = 0.0f;
+          }
+        }
+        threadgroup StageT* dst =
+            (upper == 0 ? Wg : Wu) + wr * BK + wc16 * 16;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+          dst[i] = static_cast<StageT>(reg[i / 4][i % 4]);
+        }
+      }
+
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      mma_op.mma_device_a_pair(x_tile, K, k0, num_rows, Wg, Wu);
+    }
+
+    mma_op.apply_swiglu(swiglu_limit);
+
+    device T* y_tile =
+        out + static_cast<int64_t>(row_start + r0) * N + n_tile;
+    if (num_rows < BM || num_outs < BN) {
+      mma_op.store_result_safe(y_tile, N, short2(num_outs, num_rows));
+    } else {
+      mma_op.store_result(y_tile, N);
+    }
+  }
+}
+
 template <
     typename T,
     typename Codec,
@@ -548,5 +797,63 @@ template <
         simd_gid,
         simd_lid);
   }
+}
+
+// Fused gate/up + SwiGLU variant of kq_gather_qmm_sorted_impl. w holds the
+// combined [2N, K] gate/up stack per expert (gate rows first); N here is the
+// gate width, so out is [S, N] and the grid is (ceil(N/BN), E). Only the
+// device-A body exists for this op: the fused tile already carries two
+// float32 accumulator sets, and staging an activation tile on top of the two
+// weight tiles would grow both the threadgroup footprint and the register
+// pressure that constrain the tile choice (see kq_segments.metal).
+template <
+    typename T,
+    typename Codec,
+    int BM = 48,
+    int BN = 64,
+    int BK = 16,
+    int WM = 2,
+    int WN = 2,
+    typename StageT = float>
+[[kernel]] void kq_gather_qmm_sorted_swiglu_impl(
+    const device uint8_t* w [[buffer(0)]],
+    const device T* x [[buffer(1)]],
+    const device uint32_t* sorted_ids [[buffer(2)]],
+    device T* out [[buffer(3)]],
+    const constant int& K [[buffer(4)]],
+    const constant int& N [[buffer(5)]],
+    const constant int& S [[buffer(6)]],
+    const constant float& swiglu_limit [[buffer(7)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  threadgroup StageT Wg[BN * BK];
+  threadgroup StageT Wu[BN * BK];
+
+  const uint expert = tgpig.y;
+  const uint row_start = kq_sorted_lower_bound(sorted_ids, (uint)S, expert);
+  const uint row_end = kq_sorted_lower_bound(sorted_ids, (uint)S, expert + 1);
+  if (row_start >= row_end) {
+    return; // uniform: no thread of this group has rows for this expert
+  }
+  const int n_tile = tgpig.x * BN;
+
+  kq_segment_span_gemm_swiglu_deva<T, Codec, BM, BN, BK, WM, WN, StageT>(
+      w,
+      x,
+      out,
+      K,
+      N,
+      swiglu_limit,
+      expert,
+      row_start,
+      row_end - row_start,
+      n_tile,
+      Wg,
+      Wu,
+      lid,
+      simd_gid,
+      simd_lid);
 }
 // clang-format on

@@ -107,13 +107,41 @@
   instantiate_segments(codec, ext, float, 64, 64, 64, half, false, t64x64x64fh) \
   instantiate_segments(codec, ext, float, 48, 128, 16, half, true, t48x128x16ah)
 
+// Fused gate/up + SwiGLU sorted kernel (device-A body only; see
+// kq_gather_qmm_sorted_swiglu_impl). The fused tile carries two float32
+// accumulator sets, which doubles the per-thread accumulator registers
+// against the plain kernel at the same BN, so the plain default's BN=128
+// does not carry over; the candidate tiles keep BN=64 and vary BM. The tag
+// namespace is the op's own (KQ_SEG_SWIGLU_TILE selects among these), so the
+// plain kernels' KQ_SEG_TILE levers stay independent.
+#define instantiate_segments_swiglu(codec, ext, type, bm, bn, bk, staget, tag) \
+  instantiate_kernel(                                                          \
+      "kquant_" #codec "_gather_qmm_sorted_swiglu_" #type "_" #tag,           \
+      kq_gather_qmm_sorted_swiglu_impl,                                        \
+      type,                                                                    \
+      ext,                                                                     \
+      bm,                                                                      \
+      bn,                                                                      \
+      bk,                                                                      \
+      2,                                                                       \
+      2,                                                                       \
+      staget)
+
+#define instantiate_segments_swiglu_type(codec, ext, type)                         \
+  instantiate_segments_swiglu(codec, ext, type, 48, 64, 16, float, t48x64x16a)     \
+  instantiate_segments_swiglu(codec, ext, type, 32, 64, 16, float, t32x64x16a)     \
+  instantiate_segments_swiglu(codec, ext, type, 48, 128, 16, float, t48x128x16a)
+
 #define instantiate_segments_all(codec, ext)                     \
   instantiate_segments_type(codec, ext, float16_t)               \
   instantiate_segments_type(codec, ext, bfloat16_t)              \
   instantiate_segments_type(codec, ext, float)                   \
   instantiate_segments_type_half(codec, ext, float16_t)          \
   instantiate_segments_type_half(codec, ext, bfloat16_t)         \
-  instantiate_segments_type_fhalf(codec, ext)
+  instantiate_segments_type_fhalf(codec, ext)                    \
+  instantiate_segments_swiglu_type(codec, ext, float16_t)        \
+  instantiate_segments_swiglu_type(codec, ext, bfloat16_t)       \
+  instantiate_segments_swiglu_type(codec, ext, float)
 
 // K-quants (256-weight super-blocks).
 instantiate_segments_all(q2_k, KqQ2_KExt)

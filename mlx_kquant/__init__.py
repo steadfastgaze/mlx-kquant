@@ -14,6 +14,8 @@ Current API:
   * ``gather_qmm_segments`` - descriptor-driven segmented MoE quantized GEMM.
   * ``gather_qmm_sorted`` - segmented MoE quantized GEMM over device-sorted
     expert ids, row ranges derived in-kernel (no host descriptor table).
+  * ``gather_qmm_sorted_swiglu`` - gather_qmm_sorted over a combined gate/up
+    expert stack with the SwiGLU fused into the kernel epilogue.
   * ``quantize`` - encode a float tensor into K-quant wire bytes (CPU or Metal).
   * ``load_gguf`` - load a GGUF file's tensors + metadata (C++ mmap memcpy).
 """
@@ -32,6 +34,7 @@ from ._ext import (  # noqa: F401
     gather_qmm,
     gather_qmm_segments,
     gather_qmm_sorted,
+    gather_qmm_sorted_swiglu,
     gather_qmv_bias,
     gather_qmv_kq,
     gather_qmv_mix_kq,
@@ -65,6 +68,7 @@ __all__ = [
     "gather_qmm",
     "gather_qmm_segments",
     "gather_qmm_sorted",
+    "gather_qmm_sorted_swiglu",
     "gather_qmv_bias",
     "gather_qmv_kq",
     "gather_qmv_mix_kq",
