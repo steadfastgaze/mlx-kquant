@@ -36,9 +36,10 @@ pytestmark = pytest.mark.skipif(
 REL_BOUND = {mx.bfloat16: 5e-3, mx.float16: 2e-3}
 
 
-def _ref_sdpa(q, k, v, scale, causal):
+def _ref_sdpa(q, k, v, scale, causal, mask=None, sinks=None):
     """f32 materialized attention. Offset-causal: query row i (of qL) attends
-    keys <= kL - qL + i, matching the kernel's mask."""
+    keys <= kL - qL + i, matching the kernel's mask. `sinks` adds one extra
+    softmax logit per query head with no value row."""
     g = q.shape[1] // k.shape[1]
     kr = mx.repeat(k, g, axis=1).astype(mx.float32)
     vr = mx.repeat(v, g, axis=1).astype(mx.float32)
@@ -48,7 +49,17 @@ def _ref_sdpa(q, k, v, scale, causal):
         rows = mx.arange(kL - qL, kL).reshape(qL, 1)
         cols = mx.arange(kL).reshape(1, kL)
         s = mx.where(cols <= rows, s, float("-inf"))
+    if mask is not None:
+        s = mx.where(mask, s, float("-inf"))
+    if sinks is not None:
+        sink_col = mx.broadcast_to(
+            sinks.astype(mx.float32).reshape(1, -1, 1, 1),
+            (*s.shape[:-1], 1),
+        )
+        s = mx.concatenate([s, sink_col], axis=-1)
     w = mx.softmax(s, axis=-1)
+    if sinks is not None:
+        w = w[..., :-1]
     return (w @ vr).astype(q.dtype)
 
 
@@ -319,6 +330,69 @@ def test_sdpa_fa_verify_causal_split_straddle():
     # the low rows' causal limits, exercising the dead-row guard in a
     # non-empty split
     _check_fa(256, 4, kL=4098, dtype=mx.bfloat16, splits=128, G=6)
+
+
+
+
+@pytest.mark.parametrize("D", [256, 512])
+@pytest.mark.parametrize("qL", [1, 4])
+def test_sdpa_vector_bool_mask(D, qL):
+    """Boolean key mask (true = attend), broadcast over heads."""
+    B, Hq, Hkv, kL = 1, 32, 1, 2048
+    dtype = mx.float16
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make(B, Hq, Hkv, qL, kL, D, dtype, seed=3 * D + qL, strided=False)
+    mkey = mx.random.key(11)
+    mask = mx.random.uniform(shape=(B, 1, qL, kL), key=mkey) > 0.3
+    mask = mask | (mx.arange(kL).reshape(1, 1, 1, kL) == 0)  # keep >= 1 key
+    mx.eval(mask)
+    got = kq.sdpa_vector(q, k, v, scale, causal=False, mask=mask)
+    ref = _ref_sdpa(q, k, v, scale, causal=False, mask=mask)
+    mx.eval(got, ref)
+    rel = _rel(got, ref)
+    print(f"  [sdpa/mask] D={D} qL={qL}: rel={rel:.3e}")
+    assert rel < REL_BOUND[dtype]
+
+
+@pytest.mark.parametrize("D", [256, 512])
+def test_sdpa_vector_sinks(D):
+    """Per-query-head attention sinks join the softmax denominator."""
+    B, Hq, Hkv, qL, kL = 1, 32, 1, 1, 2048
+    dtype = mx.float16
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make(B, Hq, Hkv, qL, kL, D, dtype, seed=D, strided=False)
+    skey = mx.random.key(17)
+    # Large positive sinks so the denominator term dominates: a sink bug shows
+    # up as a big rel error, not noise.
+    sinks = (mx.random.normal((Hq,), key=skey) * 2.0 + 4.0).astype(mx.float16)
+    mx.eval(sinks)
+    got = kq.sdpa_vector(q, k, v, scale, causal=False, sinks=sinks)
+    ref = _ref_sdpa(q, k, v, scale, causal=False, sinks=sinks)
+    mx.eval(got, ref)
+    rel = _rel(got, ref)
+    print(f"  [sdpa/sinks] D={D}: rel={rel:.3e}")
+    assert rel < REL_BOUND[dtype]
+
+
+def test_sdpa_vector_mask_and_sinks_mqa_512():
+    """The DS4 decode shape: 64 query heads on one shared K=V latent head
+    (wide MQA, one head per threadgroup), head dim 512, qL=1, a boolean
+    pooled-column mask, and per-head sinks together."""
+    B, Hq, Hkv, qL, kL, D = 1, 64, 1, 1, 1024, 512
+    dtype = mx.float16
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make(B, Hq, Hkv, qL, kL, D, dtype, seed=29, strided=True)
+    mkey, skey = mx.random.split(mx.random.key(23), 2)
+    mask = mx.random.uniform(shape=(B, 1, qL, kL), key=mkey) > 0.5
+    mask = mask | (mx.arange(kL).reshape(1, 1, 1, kL) == 0)
+    sinks = mx.random.normal((Hq,), key=skey).astype(mx.float16)
+    mx.eval(mask, sinks)
+    got = kq.sdpa_vector(q, k, v, scale, causal=False, mask=mask, sinks=sinks)
+    ref = _ref_sdpa(q, k, v, scale, causal=False, mask=mask, sinks=sinks)
+    mx.eval(got, ref)
+    rel = _rel(got, ref)
+    print(f"  [sdpa/mask+sinks] MQA D=512: rel={rel:.3e}")
+    assert rel < REL_BOUND[dtype]
 
 
 def main():

@@ -1,20 +1,24 @@
 // Vector scaled-dot-product-attention kernels for large head dims (e.g. 512)
 // that stock MLX's vector allowlist {64,96,128,256} excludes, forcing a
-// materialized fallback. Derived from MLX's sdpa_vector_2pass (MIT); the mask,
-// sink and query-transposed paths are dropped (callers route only causal / full
-// attention with a row-contiguous query). K and V are read in place via their
-// head/seq strides so a strided KV-cache prefix needs no copy.
+// materialized fallback. Derived from MLX's sdpa_vector_2pass (MIT); the
+// query-transposed path is dropped (callers route a row-contiguous query). K
+// and V are read in place via their head/seq strides so a strided KV-cache
+// prefix needs no copy. An optional boolean column mask (broadcastable over
+// batch/head/query via zero strides) gates keys in pass 1, and optional
+// per-query-head attention sinks join the softmax denominator in pass 2.
 //
 // Two passes: pass 1 splits the keys into `blocks` chunks, each chunk computing
 // a partial online-softmax output + running max + running sum; pass 2 reduces
-// the per-chunk partials into the final output. `do_causal` and `blocks` are
-// Metal function constants so the key-stride loop specializes at pipeline
-// build.
+// the per-chunk partials into the final output. `do_causal`, `blocks`,
+// `has_mask` and `has_sinks` are Metal function constants so the key-stride
+// loop specializes at pipeline build.
 
 constant bool do_causal [[function_constant(0)]];
 constant int blocks [[function_constant(1)]];
 constant int gqa_splits [[function_constant(2)]];
 constant bool gqa_has_sinks [[function_constant(3)]];
+constant bool has_mask [[function_constant(4)]];
+constant bool has_sinks [[function_constant(5)]];
 
 template <typename T, int D, int V = D>
 [[kernel]] void kq_sdpa_vector_2pass_1(
@@ -30,6 +34,13 @@ template <typename T, int D, int V = D>
     const constant size_t& v_head_stride [[buffer(9)]],
     const constant size_t& v_seq_stride [[buffer(10)]],
     const constant float& scale [[buffer(11)]],
+    const device bool* mask [[buffer(12), function_constant(has_mask)]],
+    const constant size_t& m_batch_stride
+        [[buffer(13), function_constant(has_mask)]],
+    const constant size_t& m_head_stride
+        [[buffer(14), function_constant(has_mask)]],
+    const constant size_t& m_q_stride
+        [[buffer(15), function_constant(has_mask)]],
     uint3 tptg [[threads_per_threadgroup]],
     uint3 tidtg [[thread_position_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -57,6 +68,10 @@ template <typename T, int D, int V = D>
   const int q_batch_head_idx = batch_idx * num_q_heads + q_head_idx;
   const int o_offset = q_batch_head_idx * q_seq_len + q_seq_idx;
 
+  if (has_mask) {
+    mask += batch_idx * m_batch_stride + q_head_idx * m_head_stride +
+        q_seq_idx * m_q_stride;
+  }
   queries += o_offset * D + simd_lid * qk_per_thread;
   const int kv_batch_head_idx = batch_idx * num_kv_heads + kv_head_idx;
   keys += kv_batch_head_idx * k_head_stride + block_idx * k_seq_stride +
@@ -78,6 +93,9 @@ template <typename T, int D, int V = D>
     bool use_key = true;
     if (do_causal) {
       use_key = i <= (N - q_seq_len + int(q_seq_idx));
+    }
+    if (has_mask) {
+      use_key = use_key && mask[i];
     }
     if (use_key) {
       U score = 0;
@@ -113,6 +131,9 @@ template <typename T, int D>
     const device float* sums [[buffer(1)]],
     const device float* maxs [[buffer(2)]],
     device T* out [[buffer(3)]],
+    const device float* sinks [[buffer(4), function_constant(has_sinks)]],
+    const constant int& num_q_heads
+        [[buffer(5), function_constant(has_sinks)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -140,12 +161,23 @@ template <typename T, int D>
     max_score = max(max_score, maxs[simd_lid + BN * b]);
   }
   max_score = simd_max(max_score);
+  // The sink is one extra softmax logit per query head with no value row: it
+  // joins the global max before the block factors are formed (so a dominant
+  // sink rescales every partial) and adds one term to the reduced denominator.
+  U sink = Limits<U>::finite_min;
+  if (has_sinks) {
+    sink = static_cast<U>(sinks[head_idx % num_q_heads]);
+    max_score = max(max_score, sink);
+  }
 
   for (int b = 0; b < blocks / BN; ++b) {
     U factor = fast::exp(maxs[simd_lid + BN * b] - max_score);
     sum_exp_score += factor * sums[simd_lid + BN * b];
   }
   sum_exp_score = simd_sum(sum_exp_score);
+  if (has_sinks) {
+    sum_exp_score += fast::exp(sink - max_score);
+  }
 
   for (int b = 0; b < blocks / BN; ++b) {
     U factor = fast::exp(maxs[simd_gid] - max_score);

@@ -147,6 +147,8 @@ NB_MODULE(_ext, m) {
       "v"_a,
       "scale"_a,
       "causal"_a = true,
+      "mask"_a = nb::none(),
+      "sinks"_a = nb::none(),
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
@@ -160,6 +162,10 @@ NB_MODULE(_ext, m) {
             v (array): values [B, n_kv_heads, kL, D].
             scale (float): query scale (typically 1/sqrt(D)).
             causal (bool): apply an offset causal mask. Default True.
+            mask (array, optional): boolean key mask broadcastable to
+                [B, n_q_heads, qL, kL]; true means attend.
+            sinks (array, optional): per-query-head attention-sink logit
+                [n_q_heads] joining the softmax denominator with no value row.
 
         Returns:
             array: attention output [B, n_q_heads, qL, D].

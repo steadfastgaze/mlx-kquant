@@ -78,9 +78,13 @@ void KQuantSDPA::eval_gpu(
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
   // q row-contiguous [B, Hq, qL, D]; k/v [B, Hkv, kL, D], D contiguous.
+  // Optional inputs follow in order: mask (bool), sinks (float32 [Hq]).
   const auto& q = inputs[0];
   const auto& k = inputs[1];
   const auto& v = inputs[2];
+  size_t next_input = 3;
+  const mx::array* mask = has_mask_ ? &inputs[next_input++] : nullptr;
+  const mx::array* sinks = has_sinks_ ? &inputs[next_input++] : nullptr;
 
   int B = q.shape(0);
   int n_q_heads = q.shape(1);
@@ -89,8 +93,6 @@ void KQuantSDPA::eval_gpu(
   int n_kv_heads = k.shape(1);
   int kL = k.shape(2);
   int gqa_factor = n_q_heads / n_kv_heads;
-  int n_simds = gqa_factor * qL;
-  int blocks = kq_sdpa_blocks(kL, n_simds, d);
 
   size_t k_head_stride =
       static_cast<size_t>(k.shape(1) == 1 ? k.strides(0) : k.strides(1));
@@ -98,6 +100,22 @@ void KQuantSDPA::eval_gpu(
   size_t v_head_stride =
       static_cast<size_t>(v.shape(1) == 1 ? v.strides(0) : v.strides(1));
   size_t v_seq_stride = static_cast<size_t>(v.strides(2));
+
+  // Wide-MQA dispatch: one threadgroup hosts the whole GQA group (32 * gqa *
+  // qL threads), which overflows the 1024-thread cap for MQA models with many
+  // query heads (e.g. 64 heads on one shared latent head). With a single kv
+  // head every group reads the same K/V, so dispatch one query head per
+  // threadgroup and broadcast K/V through a zero head stride instead. The
+  // kernel folds the batch offset into the same stride, so this mode is
+  // limited to B == 1 (the op validates that).
+  if (32 * gqa_factor * qL > 1024 && n_kv_heads == 1 && B == 1) {
+    n_kv_heads = n_q_heads;
+    gqa_factor = 1;
+    k_head_stride = 0;
+    v_head_stride = 0;
+  }
+  int n_simds = gqa_factor * qL;
+  int blocks = kq_sdpa_blocks(kL, n_simds, d);
   float scale = scale_;
 
   // Per-block partials + running max/sum, reduced by pass 2.
@@ -117,17 +135,34 @@ void KQuantSDPA::eval_gpu(
 
   std::string ts = kq_type_string(q.dtype());
   bool causal = causal_;
+  bool with_mask = has_mask_;
+  bool with_sinks = has_sinks_;
   mx::metal::MTLFCList fc = {
       {&causal, MTL::DataType::DataTypeBool, 0},
       {&blocks, MTL::DataType::DataTypeInt, 1},
+      {&with_mask, MTL::DataType::DataTypeBool, 4},
+      {&with_sinks, MTL::DataType::DataTypeBool, 5},
   };
+
+  // Broadcast dims read through zero strides; the column stride is 1 (the op
+  // contiguizes the mask's last dim).
+  size_t m_batch_stride = 0, m_head_stride = 0, m_q_stride = 0;
+  if (mask != nullptr) {
+    m_batch_stride =
+        mask->shape(0) == 1 ? 0 : static_cast<size_t>(mask->strides(0));
+    m_head_stride =
+        mask->shape(1) == 1 ? 0 : static_cast<size_t>(mask->strides(1));
+    m_q_stride =
+        mask->shape(2) == 1 ? 0 : static_cast<size_t>(mask->strides(2));
+  }
 
   // Pass 1: each (kv-head, batch, block) threadgroup computes a partial output.
   {
     std::string kname =
         "kq_sdpa_vector_2pass_1_" + ts + "_" + std::to_string(D);
-    std::string hash =
-        kname + (causal ? "_c1" : "_c0") + "_b" + std::to_string(blocks);
+    std::string hash = kname + (causal ? "_c1" : "_c0") + "_b" +
+        std::to_string(blocks) + (with_mask ? "_m1" : "_m0") +
+        (with_sinks ? "_s1" : "_s0");
     auto kernel = kq_get_kernel(d, kname, hash, fc);
     // Register-heavy pipeline: some GPUs cap it below the dispatch width, and
     // Metal turns an oversized dispatch into silent garbage, not an error.
@@ -151,6 +186,12 @@ void KQuantSDPA::eval_gpu(
     ce.set_bytes(v_head_stride, 9);
     ce.set_bytes(v_seq_stride, 10);
     ce.set_bytes(scale, 11);
+    if (mask != nullptr) {
+      ce.set_input_array(*mask, 12);
+      ce.set_bytes(m_batch_stride, 13);
+      ce.set_bytes(m_head_stride, 14);
+      ce.set_bytes(m_q_stride, 15);
+    }
     MTL::Size group_dims(32, gqa_factor, qL);
     MTL::Size grid_dims(n_kv_heads, B, blocks);
     ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -160,13 +201,18 @@ void KQuantSDPA::eval_gpu(
   {
     std::string kname =
         "kq_sdpa_vector_2pass_2_" + ts + "_" + std::to_string(D);
-    std::string hash = kname + "_b" + std::to_string(blocks);
+    std::string hash = kname + "_b" + std::to_string(blocks) +
+        (with_sinks ? "_s1" : "_s0");
     auto kernel = kq_get_kernel(d, kname, hash, fc);
     ce.set_compute_pipeline_state(kernel);
     ce.set_input_array(partials, 0);
     ce.set_input_array(sums, 1);
     ce.set_input_array(maxs, 2);
     ce.set_output_array(out, 3);
+    if (sinks != nullptr) {
+      ce.set_input_array(*sinks, 4);
+      ce.set_bytes(n_q_heads, 5);
+    }
     MTL::Size group_dims(1024, 1, 1);
     MTL::Size grid_dims(B * n_q_heads, qL, 1);
     ce.dispatch_threadgroups(grid_dims, group_dims);
@@ -444,7 +490,8 @@ std::vector<mx::Shape> KQuantSDPA::output_shapes(
 
 bool KQuantSDPA::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantSDPA&>(other);
-  return scale_ == o.scale_ && causal_ == o.causal_;
+  return scale_ == o.scale_ && causal_ == o.causal_ &&
+      has_mask_ == o.has_mask_ && has_sinks_ == o.has_sinks_;
 }
 
 mx::array sdpa_vector(
@@ -453,6 +500,8 @@ mx::array sdpa_vector(
     mx::array v,
     float scale,
     bool causal,
+    std::optional<mx::array> mask,
+    std::optional<mx::array> sinks,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
 
@@ -486,14 +535,42 @@ mx::array sdpa_vector(
   }
   int qL = q.shape(2);
   int gqa_factor = n_q_heads / n_kv_heads;
-  // pass-1 threadgroup is 32 * gqa_factor * qL threads; cap at the Metal max.
-  if (32 * gqa_factor * qL > 1024) {
+  // pass-1 threadgroup is 32 * gqa_factor * qL threads, capped at the Metal
+  // max. Above the cap only the B==1 single-kv-head (wide MQA) dispatch is
+  // available: one query head per threadgroup with broadcast K/V.
+  if (32 * gqa_factor * qL > 1024 &&
+      !(n_kv_heads == 1 && q.shape(0) == 1 && 32 * qL <= 1024)) {
     throw std::invalid_argument(
-        "[mlx_kquant.sdpa_vector] gqa_factor * qL exceeds the 32-wide limit.");
+        "[mlx_kquant.sdpa_vector] gqa_factor * qL exceeds the 32-wide limit "
+        "(wide MQA is supported only for B == 1, n_kv_heads == 1).");
   }
   if (qL > k.shape(2)) {
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_vector] query length exceeds key length.");
+  }
+
+  int kL = k.shape(2);
+  if (mask.has_value()) {
+    if (mask->ndim() != 4 || mask->dtype() != mx::bool_) {
+      throw std::invalid_argument(
+          "[mlx_kquant.sdpa_vector] mask must be a 4-D boolean array.");
+    }
+    if (mask->shape(3) != kL) {
+      throw std::invalid_argument(
+          "[mlx_kquant.sdpa_vector] mask last dim must equal key length.");
+    }
+    auto bad_dim = [](int m, int full) { return m != 1 && m != full; };
+    if (bad_dim(mask->shape(0), q.shape(0)) ||
+        bad_dim(mask->shape(1), n_q_heads) || bad_dim(mask->shape(2), qL)) {
+      throw std::invalid_argument(
+          "[mlx_kquant.sdpa_vector] mask must broadcast to [B, Hq, qL, kL].");
+    }
+  }
+  if (sinks.has_value()) {
+    if (sinks->size() != static_cast<size_t>(n_q_heads)) {
+      throw std::invalid_argument(
+          "[mlx_kquant.sdpa_vector] sinks must hold one logit per query head.");
+    }
   }
 
   // q small -> contiguize if needed (cheap). k/v: only the last (head) dim must
@@ -503,12 +580,28 @@ mx::array sdpa_vector(
   auto k_c = k.strides().back() == 1 ? k : mx::contiguous(k, false, s);
   auto v_c = v.strides().back() == 1 ? v : mx::contiguous(v, false, s);
 
-  auto out_shape = q_c.shape();
+  std::vector<mx::array> inputs = {
+      std::move(q_c), std::move(k_c), std::move(v_c)};
+  if (mask.has_value()) {
+    auto m = mask->strides().back() == 1
+        ? *mask
+        : mx::contiguous(*mask, false, s);
+    inputs.push_back(std::move(m));
+  }
+  if (sinks.has_value()) {
+    inputs.push_back(mx::astype(
+        mx::contiguous(mx::reshape(*sinks, {n_q_heads}, s), false, s),
+        mx::float32,
+        s));
+  }
+
+  auto out_shape = inputs[0].shape();
   return mx::array(
       std::move(out_shape),
       dt,
-      std::make_shared<KQuantSDPA>(s, scale, causal),
-      {std::move(q_c), std::move(k_c), std::move(v_c)});
+      std::make_shared<KQuantSDPA>(
+          s, scale, causal, mask.has_value(), sinks.has_value()),
+      std::move(inputs));
 }
 
 void KQuantSDPAGQA::eval_cpu(

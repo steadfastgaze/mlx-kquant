@@ -106,13 +106,18 @@ std::vector<mx::array> quantize(
 // [B, n_q_heads, qL, D] / [B, n_kv_heads, kL, D] (GQA: n_q_heads % n_kv_heads
 // == 0); q is made row-contiguous, k/v are read in place via their strides.
 // `causal` applies an offset causal mask (query row i attends keys <= kL - qL +
-// i). Returns the attention output [B, n_q_heads, qL, D]. Metal-only.
+// i). `mask` is an optional boolean key mask broadcastable to
+// [B, n_q_heads, qL, kL] (true = attend). `sinks` is an optional per-query-head
+// logit [n_q_heads] that joins the softmax denominator with no value row.
+// Returns the attention output [B, n_q_heads, qL, D]. Metal-only.
 mx::array sdpa_vector(
     mx::array q,
     mx::array k,
     mx::array v,
     float scale,
     bool causal = true,
+    std::optional<mx::array> mask = std::nullopt,
+    std::optional<mx::array> sinks = std::nullopt,
     mx::StreamOrDevice s = {});
 
 // Decode-time (qL == 1) GQA attention tuned for long KV: fixed coarse
@@ -430,8 +435,17 @@ class KQuantQmvBias : public mx::Primitive {
 // base-class throwing defaults. eval_cpu throws (Metal-only kernel).
 class KQuantSDPA : public mx::Primitive {
  public:
-  explicit KQuantSDPA(mx::Stream stream, float scale, bool causal)
-      : mx::Primitive(stream), scale_(scale), causal_(causal) {}
+  explicit KQuantSDPA(
+      mx::Stream stream,
+      float scale,
+      bool causal,
+      bool has_mask,
+      bool has_sinks)
+      : mx::Primitive(stream),
+        scale_(scale),
+        causal_(causal),
+        has_mask_(has_mask),
+        has_sinks_(has_sinks) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -451,6 +465,8 @@ class KQuantSDPA : public mx::Primitive {
  private:
   float scale_;
   bool causal_;
+  bool has_mask_;
+  bool has_sinks_;
 };
 
 // Decode-time GQA attention (see sdpa_decode_gqa). Sinks presence is encoded
