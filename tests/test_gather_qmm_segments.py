@@ -346,3 +346,93 @@ def test_gather_qmm_segments_fhalf_staging_optin(tile):
     )
     assert proc.returncode == 0, f"{tile}: {proc.stderr}"
     assert "FHALF_OK" in proc.stdout, f"{tile}: {proc.stdout}\n{proc.stderr}"
+
+
+# The register-direct opt-in tiles (KQ_SEG_TILE suffix dr) decode B fragment
+# values straight into registers with no threadgroup staging. The decode
+# arithmetic, fragment values, and tile_matmad sequence match the float
+# tiles, so the contract is byte-equality with the default tile, not a
+# tolerance bound. KQ_SEG_TILE is read once per process, so each arm runs in
+# its own subprocess and the raw output hashes are compared. N = 192
+# exercises a partial final n-tile at BN=128; the ragged spec covers partial
+# row chunks. The dr tiles are instantiated for iq2_xxs and q2_k only.
+_DR_TILE_HASHES = textwrap.dedent(
+    """
+    import hashlib
+    import numpy as np
+    import mlx.core as mx
+    import mlx_kquant as kq
+
+    rng = np.random.default_rng(0)
+    K, N, E = 512, 192, 6
+    imat = mx.array((np.abs(rng.standard_normal(K)) + 0.1).astype(np.float32))
+    experts = {}
+    for codec in ("iq2_xxs", "q2_k"):
+        wq = []
+        for _ in range(E):
+            w_np = (rng.standard_normal((N, K)) * 0.1).astype(np.float32)
+            q, _ = kq.quantize(
+                mx.array(w_np), codec,
+                imatrix=imat if codec == "iq2_xxs" else None,
+            )
+            mx.eval(q)
+            wq.append(np.ascontiguousarray(np.array(q).astype(np.uint8)))
+        experts[codec] = mx.array(np.stack(wq))
+    spec = [(0, 1), (1, 3), (2, 37), (3, 90), (4, 250)]
+    rows = []
+    start = 0
+    for e, c in spec:
+        rows.append((e, start, c))
+        start += c
+    S = start
+    seg = mx.array(np.array(rows, dtype=np.uint32))
+    x_np = (rng.standard_normal((S, K)) * 0.1).astype(np.float32)
+    scales = mx.zeros((1,), dtype=mx.uint8)
+    for codec in ("iq2_xxs", "q2_k"):
+        for dtype in (mx.float16, mx.bfloat16, mx.float32):
+            x = mx.array(x_np).astype(dtype)
+            out = kq.gather_qmm_segments(x, experts[codec], scales, codec, seg)
+            mx.eval(out)
+            # bfloat16 has no numpy view; the f32 upcast is exact, so hashing
+            # the upcast preserves byte-equality comparisons.
+            h = hashlib.sha256(
+                np.array(out.astype(mx.float32)).tobytes()
+            ).hexdigest()
+            print(codec, dtype, h)
+    """
+)
+
+_DR_HASH_CACHE: dict = {}
+
+
+def _dr_tile_hashes(tile):
+    """Run the hash script with KQ_SEG_TILE pinned (None = default tile)."""
+    if tile in _DR_HASH_CACHE:
+        return _DR_HASH_CACHE[tile]
+    env = dict(os.environ)
+    env.pop("KQ_SEG_TILE", None)
+    if tile is not None:
+        env["KQ_SEG_TILE"] = tile
+    proc = subprocess.run(
+        [sys.executable, "-c", _DR_TILE_HASHES],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, f"{tile}: {proc.stderr}"
+    _DR_HASH_CACHE[tile] = proc.stdout
+    return proc.stdout
+
+
+@pytest.mark.parametrize(
+    "tile", ["t48x128x16dr", "t48x128x16dr2", "t48x64x16dr"]
+)
+def test_gather_qmm_segments_devr_bit_identical(tile):
+    if mx.default_device() == mx.cpu:
+        pytest.skip("register-direct opt-in is a GPU kernel path")
+    default = _dr_tile_hashes(None)
+    got = _dr_tile_hashes(tile)
+    assert got == default, (
+        f"{tile} output hashes diverge from the default tile:\n"
+        f"{got}\nvs\n{default}"
+    )

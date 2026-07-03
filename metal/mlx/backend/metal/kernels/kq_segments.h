@@ -30,21 +30,46 @@
 // x is row-contiguous [S, K]; out is [S, N]. transpose=True only (each expert
 // w is [N, K]).
 //
-// Two GEMM bodies, selected per tile by the DEVA template flag:
+// Three GEMM bodies, selected per tile by the BODY template flag:
 //
-//   * DEVA=0 (kq_segment_span_gemm): both operands staged through threadgroup
+//   * BODY=0 (kq_segment_span_gemm): both operands staged through threadgroup
 //     tiles and multiplied by the steel BlockMMA. The original body; the
 //     legacy tiles and the half-staging opt-ins keep it.
-//   * DEVA=1 (kq_segment_span_gemm_deva): only the weight tile is staged
+//   * BODY=1 (kq_segment_span_gemm_deva): only the weight tile is staged
 //     (unpadded [BN, BK]); A fragments load straight from the device
 //     activation rows through KqSegDevAMMA. The activation staging traffic,
 //     its share of the threadgroup footprint, and the tile padding all
-//     disappear, which lifts occupancy. Bit-identical to DEVA=0: the fragment
+//     disappear, which lifts occupancy. Bit-identical to BODY=0: the fragment
 //     values are the same casts and tile_matmad runs the same call sequence,
 //     so each output element accumulates in the same order. At the sorted MoE
 //     bulk-prefill shape (S=23058, K=N=4096, E=256, iq2_xxs, f16 x) the
 //     default deva tile measures 89.3-91.0 ms against 105.6-106.5 ms for the
 //     best staged tile (alternating matched arms), with byte-equal outputs.
+//   * BODY=2 (kq_segment_span_gemm_devr): no threadgroup staging for either
+//     operand and no barriers. A fragments load from device rows exactly as
+//     BODY=1; B fragment values decode straight from the expert wire bytes
+//     into registers through KqSegPair8, each thread decoding exactly the
+//     weight positions its fragments hold. Fragment values and the
+//     tile_matmad call sequence are unchanged, so outputs stay bit-identical
+//     to the staged bodies (measured byte-equal on real expert wire bytes at
+//     the bulk-prefill shape). The trade is decode redundancy for the removed
+//     round-trip: the cooperative staging pass decodes each 16-weight chunk
+//     once per threadgroup, while the register decode repeats each column
+//     chunk's header work across the fragment's eight k-row lanes and the WM
+//     simdgroups sharing the fragment set (8 x WM repetitions). Measured, the
+//     redundancy loses decisively: on the sorted MoE bulk-prefill pair
+//     (iq2_xxs gate/up K=4096 plus q2_k down K=2048, S=23058, E=256, f32 x,
+//     real expert wire bytes, alternating matched arms) the WM=1/WN=4 dr
+//     tile runs 188.4-188.9 ms against the deva default's 147.7-148.2 ms,
+//     the WM=2/WN=2 geometry 288.4 ms, and the BN=64 variant 214.6 ms. The
+//     WM=2 arm doubling the per-thread pair decodes and costing ~100 ms more
+//     pins the loss on decode arithmetic, not on the fragment loads, so no
+//     fragment-direct geometry can win: the 8x8 fragment layout hands each
+//     thread column pairs at one k row while the codecs decode 16 contiguous
+//     k of one column, the mismatch that forces the header repetition, and
+//     the whole in-loop decode budget is only ~10-13 ms/layer. The dr tiles
+//     stay as opt-in benchmark levers recording that measurement, never the
+//     default.
 //
 // Two entry points share the bodies, so any (expert, row range, n-tile)
 // triple computes bit-identically whichever kernel dispatched it:
@@ -387,6 +412,199 @@ METAL_FUNC void kq_segment_span_gemm_deva(
   }
 }
 
+// Pair decode for the register-direct body: the two weights at natural
+// positions il*16 + i and il*16 + i + 8 of one super-block (i in [0, 8)),
+// sharing the per-chunk header work between the two. The generic form decodes
+// the full 16-weight chunk through the codec's deq_chunk16 and extracts the
+// pair, so any codec instantiates; the iq2_xxs and q2_k specializations
+// decode only the pair with per-value arithmetic identical to deq_chunk16's,
+// so the decoded floats are bit-identical to the staged tiles' whichever form
+// runs.
+template <typename Codec>
+struct KqSegPair8 {
+  static METAL_FUNC float2
+  deq(const device uint8_t* block, short il, short i) {
+    float4x4 reg;
+    Codec::deq_chunk16(block, il, reg);
+    const short i2 = i + 8;
+    return float2(reg[i / 4][i % 4], reg[i2 / 4][i2 % 4]);
+  }
+};
+
+// iq2_xxs: positions il*16 + i and il*16 + i + 8 sit in consecutive 8-weight
+// groups (lbase and lbase + 1) at the same byte index i, under one shared
+// signbits word and block scale (the header of kq_iq2_xxs_deq_chunk16).
+template <>
+struct KqSegPair8<KqIq2_xxsExt> {
+  static METAL_FUNC float2
+  deq(const device uint8_t* block, short il, short i) {
+    const int ib32 = il / 2;
+    const int lbase = (il & 1) * 2;
+    const float d = float(*(const device half*)block);
+    const device uint8_t* qs = block + KQ_IQ2_XXS_QS_OFFSET + ib32 * 8;
+    const uint32_t signbits = uint32_t(qs[4]) | (uint32_t(qs[5]) << 8) |
+        (uint32_t(qs[6]) << 16) | (uint32_t(qs[7]) << 24);
+    const float db = d * (0.5f + float(signbits >> 28)) * 0.25f;
+    const uint8_t signs0 = ksigns_iq2xs[(signbits >> (7 * lbase)) & 127];
+    const uint8_t gb0 = (iq2xxs_grid[qs[lbase]] >> (8 * i)) & 0xff;
+    const float sgn0 = (signs0 & kmask_iq2xs[i]) ? -1.0f : 1.0f;
+    const uint8_t signs1 = ksigns_iq2xs[(signbits >> (7 * (lbase + 1))) & 127];
+    const uint8_t gb1 = (iq2xxs_grid[qs[lbase + 1]] >> (8 * i)) & 0xff;
+    const float sgn1 = (signs1 & kmask_iq2xs[i]) ? -1.0f : 1.0f;
+    return float2(db * float(gb0) * sgn0, db * float(gb1) * sgn1);
+  }
+};
+
+// q2_k: both positions share the chunk's scale byte, mask, and coefficient
+// (the header of kq_q2_k_deq_chunk16); only the q byte index differs.
+template <>
+struct KqSegPair8<KqQ2_KExt> {
+  static METAL_FUNC float2
+  deq(const device uint8_t* block, short il, short i) {
+    const float d = kq_q2_k_d(block);
+    const float dmin = kq_q2_k_dmin(block);
+    const device uint8_t* q =
+        kq_q2_k_qs_ptr(block) + 32 * (il / 8) + 16 * (il & 1);
+    const uint8_t sc = kq_q2_k_scales_ptr(block)[il];
+    const short sh = (il / 2) % 4;
+    const float coef = sh > 1 ? (sh > 2 ? 1.0f / 64.0f : 1.0f / 16.0f)
+                              : (sh > 0 ? 1.0f / 4.0f : 1.0f);
+    const uint8_t mask = sh > 1 ? (sh > 2 ? 192 : 48) : (sh > 0 ? 12 : 3);
+    const float dl = d * float(sc & 0xF) * coef;
+    const float ml = dmin * float(sc >> 4);
+    return float2(
+        dl * float(q[i] & mask) - ml, dl * float(q[i + 8] & mask) - ml);
+  }
+};
+
+// Register-direct segment-span GEMM: no threadgroup memory and no barriers.
+// A fragments load from the device activation rows with the exact
+// KqSegDevAMMA loads; B fragment values decode straight from the wire bytes
+// into registers. Per k-step each thread pair-decodes the TN * 2 weight
+// columns its B fragments hold (positions fm and fm + 8 of one 16-weight
+// chunk, one shared header per column), so the whole BK=16 step's B operands
+// sit in registers before the two kk sub-steps run. Fragment values match
+// the staged tiles (same decode arithmetic, same casts) and tile_matmad runs
+// the same call sequence, so outputs are bit-identical to BODY=0/1.
+template <typename T, typename Codec, int BM, int BN, int BK, int WM, int WN>
+METAL_FUNC void kq_segment_span_gemm_devr(
+    const device uint8_t* w,
+    const device T* x,
+    device T* out,
+    const int K,
+    const int N,
+    const uint expert,
+    const uint row_start,
+    const uint row_count,
+    const int n_tile,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(BK == 16, "devr tiles keep one 16-weight chunk per k-step");
+
+  constexpr short kFragSize = 8;
+  using MMAFrag_acc_t = mlx::steel::BaseMMAFrag<float, 8, 8>;
+  constexpr short TM_stride = kFragSize * WM;
+  constexpr short TN_stride = kFragSize * WN;
+  constexpr short TM = BM / (kFragSize * WM);
+  constexpr short TN = BN / (kFragSize * WN);
+
+  const short tm = kFragSize * short(simd_gid / WN);
+  const short tn = kFragSize * short(simd_gid % WN);
+  const short2 simd_coord = MMAFrag_acc_t::get_coord(simd_lid);
+  const short fn = simd_coord.x; // even element-pair base within a fragment
+  const short fm = simd_coord.y; // row within a fragment
+
+  const short num_outs = min(BN, N - n_tile);
+  const int nb = K / Codec::superblock;
+  const int row_bytes = nb * Codec::block_bytes;
+  const device uint8_t* w_expert =
+      w + static_cast<int64_t>(expert) * N * row_bytes;
+  constexpr int chpb = Codec::superblock / 16;
+
+  for (uint r0 = 0; r0 < row_count; r0 += BM) {
+    const short num_rows = min((int)BM, (int)(row_count - r0));
+    const device T* x_tile = x + static_cast<int64_t>(row_start + r0) * K;
+
+    mlx::steel::MMATile<float, TM, 1, MMAFrag_acc_t> Atile;
+    mlx::steel::MMATile<float, 1, TN, MMAFrag_acc_t> Btile;
+    mlx::steel::MMATile<float, TM, TN, MMAFrag_acc_t> Ctile;
+
+    for (int k0 = 0; k0 < K; k0 += BK) {
+      // Decode this thread's B fragment weights for the whole BK step. Weight
+      // columns past num_outs read as zero, matching the staged tiles' fill.
+      const int ich = k0 / 16;
+      const int ib = ich / chpb;
+      const short cch = short(ich % chpb);
+      float2 wpair[TN][2];
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < TN; ++j) {
+        STEEL_PRAGMA_UNROLL
+        for (short c = 0; c < 2; ++c) {
+          const short col = tn + j * TN_stride + fn + c;
+          if (col < num_outs) {
+            const device uint8_t* block = w_expert +
+                static_cast<int64_t>(n_tile + col) * row_bytes +
+                static_cast<int64_t>(ib) * Codec::block_bytes;
+            wpair[j][c] = KqSegPair8<Codec>::deq(block, cch, fm);
+          } else {
+            wpair[j][c] = float2(0.0f, 0.0f);
+          }
+        }
+      }
+
+      STEEL_PRAGMA_UNROLL
+      for (short kk = 0; kk < BK; kk += kFragSize) {
+        simdgroup_barrier(mem_flags::mem_none);
+
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < TM; ++i) {
+          const short row = tm + fm + i * TM_stride;
+          thread auto& frag = Atile.frag_at(i, 0);
+          if (row < num_rows) {
+            const device T* src =
+                x_tile + static_cast<int64_t>(row) * K + k0 + kk + fn;
+            frag[0] = static_cast<float>(src[0]);
+            frag[1] = static_cast<float>(src[1]);
+          } else {
+            frag[0] = 0.0f;
+            frag[1] = 0.0f;
+          }
+        }
+
+        simdgroup_barrier(mem_flags::mem_none);
+
+        // kk = 0 consumes chunk position fm (the pair's first element),
+        // kk = 8 position fm + 8 (the second); kk is unrolled so the
+        // selects fold.
+        const short h = kk / kFragSize;
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < TN; ++j) {
+          thread auto& bfrag = Btile.frag_at(0, j);
+          bfrag[0] = h == 0 ? wpair[j][0].x : wpair[j][0].y;
+          bfrag[1] = h == 0 ? wpair[j][1].x : wpair[j][1].y;
+        }
+
+        simdgroup_barrier(mem_flags::mem_none);
+
+        mlx::steel::tile_matmad(Ctile, Atile, Btile, Ctile);
+      }
+    }
+
+    // Store, mirroring KqSegDevAMMA::store_result(_safe).
+    device T* D = out + static_cast<int64_t>(row_start + r0) * N + n_tile +
+        (tm + fm) * N + (tn + fn);
+    if (num_rows < BM || num_outs < BN) {
+      const short2 dst_tile_dims =
+          short2(num_outs - (tn + fn), num_rows - (tm + fm));
+      if (dst_tile_dims.x > 0 && dst_tile_dims.y > 0) {
+        Ctile.template store_safe<T, WM, WN>(D, N, dst_tile_dims);
+      }
+    } else {
+      Ctile.template store<T, WM, WN>(D, N);
+    }
+  }
+}
+
 template <
     typename T,
     typename Codec,
@@ -396,7 +614,7 @@ template <
     int WM = 2,
     int WN = 2,
     typename StageT = float,
-    bool DEVA = false>
+    int BODY = 0>
 [[kernel]] void kq_gather_qmm_segments_impl(
     const device uint8_t* w [[buffer(0)]],
     const device T* x [[buffer(1)]],
@@ -413,9 +631,10 @@ template <
 
   // Threadgroup staging. The staged body uses a padded activation tile and a
   // padded weight tile; the device-A body stages only the unpadded weight
-  // tile, and Xs shrinks to a placeholder its branch never touches.
-  threadgroup StageT Xs[DEVA ? 1 : BM * BK_padded];
-  threadgroup StageT Ws[DEVA ? BN * BK : BN * BK_padded];
+  // tile; the register-direct body stages nothing, so both arrays shrink to
+  // placeholders its branch never touches.
+  threadgroup StageT Xs[BODY == 0 ? BM * BK_padded : 1];
+  threadgroup StageT Ws[BODY == 0 ? BN * BK_padded : (BODY == 1 ? BN * BK : 1)];
 
   // Descriptor for this threadgroup's segment: {expert, row_start, row_count}.
   const uint seg = tgpig.y;
@@ -424,7 +643,21 @@ template <
   const uint row_count = segments[seg * 3 + 2];
   const int n_tile = tgpig.x * BN; // first output feature this tile owns
 
-  if constexpr (DEVA) {
+  if constexpr (BODY == 2) {
+    (void)lid;
+    kq_segment_span_gemm_devr<T, Codec, BM, BN, BK, WM, WN>(
+        w,
+        x,
+        out,
+        K,
+        N,
+        expert,
+        row_start,
+        row_count,
+        n_tile,
+        simd_gid,
+        simd_lid);
+  } else if constexpr (BODY == 1) {
     kq_segment_span_gemm_deva<T, Codec, BM, BN, BK, WM, WN, StageT>(
         w,
         x,
@@ -736,7 +969,7 @@ template <
     int WM = 2,
     int WN = 2,
     typename StageT = float,
-    bool DEVA = false>
+    int BODY = 0>
 [[kernel]] void kq_gather_qmm_sorted_impl(
     const device uint8_t* w [[buffer(0)]],
     const device T* x [[buffer(1)]],
@@ -751,8 +984,8 @@ template <
     uint simd_lid [[thread_index_in_simdgroup]]) {
   constexpr int BK_padded = (BK >= 64) ? BK : (BK + 16 / sizeof(StageT));
 
-  threadgroup StageT Xs[DEVA ? 1 : BM * BK_padded];
-  threadgroup StageT Ws[DEVA ? BN * BK : BN * BK_padded];
+  threadgroup StageT Xs[BODY == 0 ? BM * BK_padded : 1];
+  threadgroup StageT Ws[BODY == 0 ? BN * BK_padded : (BODY == 1 ? BN * BK : 1)];
 
   // This threadgroup's segment is the run of rows whose sorted id equals its
   // grid.y expert index; the ids are ascending so the run is exactly
@@ -765,7 +998,21 @@ template <
   }
   const int n_tile = tgpig.x * BN;
 
-  if constexpr (DEVA) {
+  if constexpr (BODY == 2) {
+    (void)lid;
+    kq_segment_span_gemm_devr<T, Codec, BM, BN, BK, WM, WN>(
+        w,
+        x,
+        out,
+        K,
+        N,
+        expert,
+        row_start,
+        row_end - row_start,
+        n_tile,
+        simd_gid,
+        simd_lid);
+  } else if constexpr (BODY == 1) {
     kq_segment_span_gemm_deva<T, Codec, BM, BN, BK, WM, WN, StageT>(
         w,
         x,

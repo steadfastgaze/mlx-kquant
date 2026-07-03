@@ -11,15 +11,16 @@
 
 // One (codec, type, staging-type, tile) instantiation. The name carries the
 // codec, I/O type token and tile tag so eval_gpu can build it from
-// kquant_type + x.dtype() + the selected tile. WM=WN=2 -> 128 threads. StageT
+// kquant_type + x.dtype() + the selected tile. WM*WN*32 = 128 threads. StageT
 // is the threadgroup tile precision (float for the f32-decode contract; the
 // I/O type for the half-staging opt-in). The trailing flag selects the GEMM
-// body: false = both operands staged (steel BlockMMA), true = device-A
-// (weight tile only, unpadded; see kq_segments.h). Every tile is instantiated
-// for both entry points: the descriptor-table kernel (gather_qmm_segments)
-// and the binary-search kernel over device-sorted ids (gather_qmm_sorted),
-// which share the GEMM bodies.
-#define instantiate_segments(codec, ext, type, bm, bn, bk, staget, deva, tag) \
+// body: 0 = both operands staged (steel BlockMMA), 1 = device-A (weight tile
+// only, unpadded), 2 = register-direct (no staging; see kq_segments.h). Every
+// tile is instantiated for both entry points: the descriptor-table kernel
+// (gather_qmm_segments) and the binary-search kernel over device-sorted ids
+// (gather_qmm_sorted), which share the GEMM bodies.
+#define instantiate_segments_wmwn(                                            \
+    codec, ext, type, bm, bn, bk, wm, wn, staget, body, tag)                   \
   instantiate_kernel(                                                          \
       "kquant_" #codec "_gather_qmm_segments_" #type "_" #tag,                 \
       kq_gather_qmm_segments_impl,                                             \
@@ -28,10 +29,10 @@
       bm,                                                                      \
       bn,                                                                      \
       bk,                                                                      \
-      2,                                                                       \
-      2,                                                                       \
+      wm,                                                                      \
+      wn,                                                                      \
       staget,                                                                  \
-      deva)                                                                    \
+      body)                                                                    \
   instantiate_kernel(                                                          \
       "kquant_" #codec "_gather_qmm_sorted_" #type "_" #tag,                   \
       kq_gather_qmm_sorted_impl,                                               \
@@ -40,10 +41,14 @@
       bm,                                                                      \
       bn,                                                                      \
       bk,                                                                      \
-      2,                                                                       \
-      2,                                                                       \
+      wm,                                                                      \
+      wn,                                                                      \
       staget,                                                                  \
-      deva)
+      body)
+
+#define instantiate_segments(codec, ext, type, bm, bn, bk, staget, body, tag) \
+  instantiate_segments_wmwn(                                                  \
+      codec, ext, type, bm, bn, bk, 2, 2, staget, body, tag)
 
 // Tile variants (tag matches KQ_SEG_TILE selection in eval_gpu). The default
 // is t48x128x16a: the device-A body (activation fragments read from device
@@ -66,24 +71,24 @@
 // kernel. The segments and sorted kernels share the selection so a
 // segments/sorted parity pair always runs the same tile.
 #define instantiate_segments_type(codec, ext, type)                              \
-  instantiate_segments(codec, ext, type, 48, 128, 16, float, true, t48x128x16a)  \
-  instantiate_segments(codec, ext, type, 64, 64, 32, float, false, t64x64x32)    \
-  instantiate_segments(codec, ext, type, 32, 64, 64, float, false, t32x64x64)    \
-  instantiate_segments(codec, ext, type, 64, 32, 64, float, false, t64x32x64)    \
-  instantiate_segments(codec, ext, type, 64, 64, 16, float, false, t64x64x16)    \
-  instantiate_segments(codec, ext, type, 32, 64, 16, float, false, t32x64x16)    \
-  instantiate_segments(codec, ext, type, 48, 64, 16, float, false, t48x64x16)    \
-  instantiate_segments(codec, ext, type, 128, 64, 32, float, false, t128x64x32)
+  instantiate_segments(codec, ext, type, 48, 128, 16, float, 1, t48x128x16a)     \
+  instantiate_segments(codec, ext, type, 64, 64, 32, float, 0, t64x64x32)        \
+  instantiate_segments(codec, ext, type, 32, 64, 64, float, 0, t32x64x64)        \
+  instantiate_segments(codec, ext, type, 64, 32, 64, float, 0, t64x32x64)        \
+  instantiate_segments(codec, ext, type, 64, 64, 16, float, 0, t64x64x16)        \
+  instantiate_segments(codec, ext, type, 32, 64, 16, float, 0, t32x64x16)        \
+  instantiate_segments(codec, ext, type, 48, 64, 16, float, 0, t48x64x16)        \
+  instantiate_segments(codec, ext, type, 128, 64, 32, float, 0, t128x64x32)
 
 // Half-staging opt-in (tag suffix h). Weights round through the I/O half type
 // before the multiply, so these trade the f32-decode contract for a smaller
 // threadgroup footprint (better occupancy). Selected only via KQ_SEG_TILE; the
 // default dispatch never picks them, so the parity tests keep the float tiles.
-#define instantiate_segments_type_half(codec, ext, type)                     \
-  instantiate_segments(codec, ext, type, 64, 64, 32, type, false, t64x64x32h) \
-  instantiate_segments(codec, ext, type, 32, 64, 64, type, false, t32x64x64h) \
-  instantiate_segments(codec, ext, type, 64, 64, 64, type, false, t64x64x64h) \
-  instantiate_segments(codec, ext, type, 48, 128, 16, half, true, t48x128x16ah)
+#define instantiate_segments_type_half(codec, ext, type)                  \
+  instantiate_segments(codec, ext, type, 64, 64, 32, type, 0, t64x64x32h)  \
+  instantiate_segments(codec, ext, type, 32, 64, 64, type, 0, t32x64x64h)  \
+  instantiate_segments(codec, ext, type, 64, 64, 64, type, 0, t64x64x64h)  \
+  instantiate_segments(codec, ext, type, 48, 128, 16, half, 1, t48x128x16ah)
 
 // Half-staging with float32 I/O (tag suffix fh). Activations and weights
 // round through half in the threadgroup tiles; I/O rows, the simdgroup
@@ -101,11 +106,42 @@
 // traffic: 136.7-137.6 ms against the float default's 143.7-144.1 ms on the
 // sorted MoE bulk-prefill pair (iq2_xxs gate/up plus q2_k down, S=23058,
 // alternating matched arms). Selected only via KQ_SEG_TILE.
-#define instantiate_segments_type_fhalf(codec, ext)                            \
-  instantiate_segments(codec, ext, float, 64, 64, 32, half, false, t64x64x32fh) \
-  instantiate_segments(codec, ext, float, 32, 64, 64, half, false, t32x64x64fh) \
-  instantiate_segments(codec, ext, float, 64, 64, 64, half, false, t64x64x64fh) \
-  instantiate_segments(codec, ext, float, 48, 128, 16, half, true, t48x128x16ah)
+#define instantiate_segments_type_fhalf(codec, ext)                        \
+  instantiate_segments(codec, ext, float, 64, 64, 32, half, 0, t64x64x32fh) \
+  instantiate_segments(codec, ext, float, 32, 64, 64, half, 0, t32x64x64fh) \
+  instantiate_segments(codec, ext, float, 64, 64, 64, half, 0, t64x64x64fh) \
+  instantiate_segments(codec, ext, float, 48, 128, 16, half, 1, t48x128x16ah)
+
+// Register-direct opt-in (tag suffix dr): no threadgroup staging for either
+// operand and no barriers; each thread decodes the weight positions its B
+// fragments hold straight into registers (BODY=2; see kq_segments.h).
+// Bit-identical to the float tiles (same decode arithmetic, same fragment
+// values, same tile_matmad sequence; measured byte-equal). WM/WN trade
+// per-thread decode redundancy against activation re-reads: the dr tiles use
+// WM=1/WN=4 so each simdgroup owns a disjoint B fragment set (TN=BN/32 pair
+// decodes per thread per k-step); dr2 keeps the default WM=2/WN=2 geometry
+// for comparison. All three measured slower than the deva default at the
+// sorted MoE bulk-prefill shape (dr 188.4-188.9 ms, dr2 288.4 ms, the BN=64
+// dr 214.6 ms, against 147.7-148.2 ms; numbers and the redundancy analysis
+// in kq_segments.h), so they stay opt-in benchmark levers. Instantiated for
+// the served MoE codec pair only (iq2_xxs gate/up, q2_k down); other codecs
+// would compile through the generic KqSegPair8 but stay uninstantiated to
+// bound the metallib. Selected only via KQ_SEG_TILE.
+#define instantiate_segments_type_devr(codec, ext, type)                          \
+  instantiate_segments_wmwn(                                                      \
+      codec, ext, type, 48, 128, 16, 1, 4, float, 2, t48x128x16dr)                \
+  instantiate_segments_wmwn(                                                      \
+      codec, ext, type, 48, 128, 16, 2, 2, float, 2, t48x128x16dr2)               \
+  instantiate_segments_wmwn(                                                      \
+      codec, ext, type, 48, 64, 16, 1, 4, float, 2, t48x64x16dr)
+
+#define instantiate_segments_devr_all(codec, ext)      \
+  instantiate_segments_type_devr(codec, ext, float16_t) \
+  instantiate_segments_type_devr(codec, ext, bfloat16_t) \
+  instantiate_segments_type_devr(codec, ext, float)
+
+instantiate_segments_devr_all(iq2_xxs, KqIq2_xxsExt)
+instantiate_segments_devr_all(q2_k, KqQ2_KExt)
 
 // Fused gate/up + SwiGLU sorted kernel (device-A body only; see
 // kq_gather_qmm_sorted_swiglu_impl). The fused tile carries two float32

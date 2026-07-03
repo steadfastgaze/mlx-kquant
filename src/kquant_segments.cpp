@@ -35,10 +35,14 @@ namespace mlx_kquant {
 namespace {
 
 // Tile geometry must match a kernel instantiation in kq_segments.metal
-// (WM=WN=2 -> WM*WN*32 = 128 threads per threadgroup). The tag is
-// t{BM}x{BN}x{BK} with an optional trailing letter: 'a' for the device-A
-// body (activation fragments read from device rows, unpadded weight tile;
-// see kq_segments.h), 'h' for the half-staging opt-in. The default
+// (WM*WN*32 = 128 threads per threadgroup). The tag is t{BM}x{BN}x{BK} with
+// an optional trailing letter: 'a' for the device-A body (activation
+// fragments read from device rows, unpadded weight tile; see kq_segments.h),
+// 'h' for the half-staging opt-in, 'dr' for the register-direct body (no
+// threadgroup staging; B fragment values decode straight into registers;
+// bit-identical, measured slower than the device-A default because the
+// per-fragment decode repeats chunk header work; instantiated for iq2_xxs
+// and q2_k only). The default
 // t48x128x16a keeps the f32-decode contract (float weight staging, float
 // accumulate) and is bit-identical to the staged float tiles; on the sorted
 // MoE bulk-prefill shape (S=23058, K=N=4096, E=256) it measures 89.3-91.0 ms
