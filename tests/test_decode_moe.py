@@ -191,6 +191,47 @@ def test_pair_swiglu_matches_unfused_composition(pair_experts):
         np.array(got, dtype=np.float64), ref, rtol=5e-2, atol=1e-2)
 
 
+def test_pair_swiglu_deep_negative_gate_is_zero():
+    """A gate accumulator past the float32 exp overflow point must produce
+    exactly zero, not NaN: for gate below about -88, exp(-gate) overflows to
+    +Inf and silu resolves as gate / Inf -> 0. The epilogue's precise::exp
+    keeps that IEEE edge; a fast-math exp leaves the Inf class undefined.
+    All-negative gate rows against all-positive x put every accumulator below
+    -100, and the up rows stay large positive so a zero can only come from
+    the silu factor."""
+    rng = np.random.default_rng(7)
+    scales = mx.zeros((1,), dtype=mx.uint8)
+    imat = mx.array((np.abs(rng.standard_normal(K)) + 0.1).astype(np.float32))
+    gate_np = -(np.abs(rng.standard_normal((GATE_OUT, K))) * 0.5 + 0.5)
+    up_np = np.abs(rng.standard_normal((GATE_OUT, K))) * 0.5 + 0.5
+    w_np = np.concatenate([gate_np, up_np]).astype(np.float32)
+    wq, _ = kq.quantize(mx.array(w_np), "iq2_xxs", imatrix=imat)
+    mx.eval(wq)
+    wq_np = np.ascontiguousarray(np.array(wq).astype(np.uint8))
+    deq = np.array(
+        kq.dequantize(mx.array(wq_np), scales, "iq2_xxs", mx.float32))
+
+    x_np = (np.abs(rng.standard_normal((1, K))) * 0.5 + 0.25).astype(np.float32)
+    x64 = x_np.astype(np.float64).reshape(K)
+    gate_ref = deq[:GATE_OUT].astype(np.float64) @ x64
+    up_ref = deq[GATE_OUT:].astype(np.float64) @ x64
+    assert gate_ref.max() < -100.0, "gate accumulators must sit past -100"
+    assert np.abs(up_ref).min() > 1.0, "up factors must stay away from zero"
+
+    w = mx.array(wq_np[None])
+    ids = mx.array(np.zeros(2, dtype=np.uint32))
+    rw = mx.array(np.ones(2, dtype=np.float32))
+    for dtype in (mx.float16, mx.bfloat16, mx.float32):
+        for limit in (0.0, SWIGLU_LIMIT_OFF):
+            got = kq.gather_qmv_pair_swiglu(
+                mx.array(x_np).astype(dtype), w, scales, "iq2_xxs", ids, rw,
+                GATE_OUT, limit)
+            mx.eval(got)
+            out = np.array(got.astype(mx.float32))
+            assert not np.isnan(out).any(), f"{dtype} limit={limit}: NaN"
+            assert (out == 0.0).all(), f"{dtype} limit={limit}: nonzero"
+
+
 def test_pair_swiglu_rejects_bad_inputs(pair_experts):
     """Fail-closed contract: uninstantiated codec, bad ids/route_weights
     dtypes and shapes, a gate_out mismatch, and a K mismatch all raise."""

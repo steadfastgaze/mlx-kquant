@@ -311,6 +311,44 @@ def test_gather_qmm_sorted_swiglu_matches_dq_f32_reference(codec):
     )
 
 
+def test_gather_qmm_sorted_swiglu_deep_negative_gate_is_zero():
+    """A gate accumulator past the float32 exp overflow point must produce
+    exactly zero, not NaN: for gate below about -88, exp(-gate) overflows to
+    +Inf and silu resolves as gate / Inf -> 0. The epilogue's precise::exp
+    keeps that IEEE edge; a fast-math exp leaves the Inf class undefined.
+    All-negative gate rows against all-positive x put every accumulator below
+    -100, and the up rows stay large positive so a zero can only come from
+    the silu factor."""
+    rng = np.random.default_rng(9)
+    scales = mx.zeros((1,), dtype=mx.uint8)
+    gate_np = -(np.abs(rng.standard_normal((N, K))) * 0.5 + 0.5)
+    up_np = np.abs(rng.standard_normal((N, K))) * 0.5 + 0.5
+    w_np = np.concatenate([gate_np, up_np]).astype(np.float32)
+    wq, _ = kq.quantize(mx.array(w_np), "q2_k")
+    mx.eval(wq)
+    wq_np = np.ascontiguousarray(np.array(wq).astype(np.uint8))
+    deq = np.array(kq.dequantize(mx.array(wq_np), scales, "q2_k", mx.float32))
+
+    S = 4
+    x_np = (np.abs(rng.standard_normal((S, K))) * 0.5 + 0.25).astype(np.float32)
+    x64 = x_np.astype(np.float64)
+    gate_ref = x64 @ deq[:N].astype(np.float64).T
+    up_ref = x64 @ deq[N:].astype(np.float64).T
+    assert gate_ref.max() < -100.0, "gate accumulators must sit past -100"
+    assert np.abs(up_ref).min() > 1.0, "up factors must stay away from zero"
+
+    w = mx.array(wq_np[None])
+    ids = mx.array(np.zeros(S, dtype=np.uint32))
+    for dtype in (mx.float16, mx.bfloat16, mx.float32):
+        for limit in (0.0, SWIGLU_LIMIT_OFF):
+            got = kq.gather_qmm_sorted_swiglu(
+                mx.array(x_np).astype(dtype), w, scales, "q2_k", ids, N, limit)
+            mx.eval(got)
+            out = np.array(got.astype(mx.float32))
+            assert not np.isnan(out).any(), f"{dtype} limit={limit}: NaN"
+            assert (out == 0.0).all(), f"{dtype} limit={limit}: nonzero"
+
+
 def test_gather_qmm_sorted_swiglu_rejects_bad_gate_out():
     """w must hold exactly 2 * gate_out rows per expert."""
     rng = np.random.default_rng(2)

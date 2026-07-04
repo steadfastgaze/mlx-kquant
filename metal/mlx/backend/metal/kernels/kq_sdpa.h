@@ -104,6 +104,9 @@ template <typename T, int D, int V = D>
       }
       score = simd_sum(score);
       U new_max = max(max_score, score);
+      // fast::exp is safe here: both arguments are non-positive by the
+      // running-max construction, so the exponent cannot overflow to +Inf;
+      // the underflow edge returns 0.
       U factor = fast::exp(max_score - new_max);
       U exp_score = fast::exp(score - new_max);
       max_score = new_max;
@@ -170,6 +173,8 @@ template <typename T, int D>
     max_score = max(max_score, sink);
   }
 
+  // fast::exp arguments below are non-positive (max_score majorizes every
+  // per-block max and the sink), so no exponent can overflow to +Inf.
   for (int b = 0; b < blocks / BN; ++b) {
     U factor = fast::exp(maxs[simd_lid + BN * b] - max_score);
     sum_exp_score += factor * sums[simd_lid + BN * b];

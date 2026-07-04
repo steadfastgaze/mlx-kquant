@@ -162,7 +162,12 @@ template <typename T, int group_size, int bits>
         gate = metal::min(gate, U(swiglu_limit));
         up = metal::clamp(up, U(-swiglu_limit), U(swiglu_limit));
       }
-      const U act = (gate / (U(1) + metal::exp(-gate))) * up;
+      // The gate is clamped from above only, so exp(-gate) overflows float32
+      // for gate below about -88. precise::exp pins the IEEE edge (+Inf, so
+      // the quotient resolves to 0); plain exp follows the build's
+      // -fmetal-math-fp32-functions selection, and under fast math the MSL
+      // spec leaves Inf and NaN behavior undefined.
+      const U act = (gate / (U(1) + metal::precise::exp(-gate))) * up;
       y[out_row + row] = static_cast<T>(act * U(route_weight));
     }
   }

@@ -836,7 +836,12 @@ struct KqSegDevAPairMMA {
         gate = metal::min(gate, limit);
         up = metal::clamp(up, -limit, limit);
       }
-      g[i] = (gate / (1.0f + metal::exp(-gate))) * up;
+      // The gate is clamped from above only, so exp(-gate) overflows float32
+      // for gate below about -88. precise::exp pins the IEEE edge (+Inf, so
+      // the quotient resolves to 0); plain exp follows the build's
+      // -fmetal-math-fp32-functions selection, and under fast math the MSL
+      // spec leaves Inf and NaN behavior undefined.
+      g[i] = (gate / (1.0f + metal::precise::exp(-gate))) * up;
     }
   }
 
