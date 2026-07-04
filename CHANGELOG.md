@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project aims to
 adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Decode-shaped routed-MoE matvec pair** (`kq.gather_qmv_pair_swiglu`,
+  `kq.gather_qmv_expert_sum`): one dispatch computes every routed expert's
+  fused gate/up + SwiGLU activation row for a single token with the route
+  weight baked into the stored intermediate (combined gate/up stack,
+  iq2_xxs), and one dispatch computes the down matvec with the sum over the
+  token's routed experts inside the kernel (q2_k), removing the separate
+  route-weighted-sum reduction. Float32 accumulate; numerically equivalent
+  but not bit-identical to the unfused gather_qmm composition. Instantiated
+  for the served DS4 decode codec pair only; other codecs fail closed at the
+  op level.
+
+
 ## [0.3.1]
 
 ### Added

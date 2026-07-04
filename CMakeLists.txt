@@ -104,6 +104,7 @@ target_sources(
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_moe_glu.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_norm_fused.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_segments.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_decode_moe.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_gather.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_encode.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_gguf.cpp)
@@ -179,6 +180,7 @@ if(MLX_BUILD_METAL)
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_moe_glu_kq.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_norm_fused.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_segments.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_decode_moe.metal
     INCLUDE_DIRS
     ${CMAKE_CURRENT_LIST_DIR}/metal
     ${MLX_INCLUDE_DIRS}

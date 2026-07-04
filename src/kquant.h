@@ -170,6 +170,53 @@ mx::array gather_qmm_sorted_swiglu(
     bool transpose = true,
     mx::StreamOrDevice s = {});
 
+// Decode-shaped fused gate/up + SwiGLU matvec over a combined gate/up MoE
+// weight stack, with the per-expert route weight baked into the stored
+// intermediate. `x` is one float activation row [1, K]; `w` holds each
+// expert's [2 * gate_out, K] stack (gate rows first, then up rows), the
+// gather_qmm_sorted_swiglu layout; `ids` is a uint32 [B] expert-id row (the
+// token's routed experts) and `route_weights` a float32 [B] row of their
+// route weights. For each slot b: gate = x @ dequant(w[ids[b]])[0:gate_out].T
+// and up = x @ dequant(w[ids[b]])[gate_out:].T on float32 accumulators, then
+// the DSV4 SwiGLU on those accumulators (swiglu_limit > 0 clamps the gate
+// from above only and up symmetrically; <= 0 disables the clamps) scaled by
+// route_weights[b], stored as x.dtype. Output is [B, gate_out] in x.dtype
+// (float32 stays float32; there is no bfloat16 promotion on this decode
+// path). Against the unfused composition the result is numerically
+// equivalent but not bit-identical (the epilogue reads the float32
+// accumulators directly). Only codecs with an instantiated pair kernel are
+// accepted (iq2_xxs); K must be whole super-blocks and gate_out a multiple
+// of 4. Metal-only.
+mx::array gather_qmv_pair_swiglu(
+    mx::array x,
+    mx::array w,
+    mx::array scales,
+    const std::string& kquant_type,
+    mx::array ids,
+    mx::array route_weights,
+    int gate_out,
+    float swiglu_limit,
+    mx::StreamOrDevice s = {});
+
+// Decode-shaped down matvec with the sum over the token's routed experts
+// fused into the kernel: out[0, n] = sum_b x[b] . dequant(w[ids[b]])[n].
+// `x` is float [B, K], row b holding routed slot b's (already route-weighted)
+// activation; `w` is the standard [n_experts, N, bytes_per_row] stack and
+// `ids` a uint32 [B] expert-id row. Each output element accumulates every
+// expert's contribution in float32 in slot order, so the separate
+// route-weighted-sum reduction disappears; against that composition the
+// result is numerically equivalent but not bit-identical. Output is [1, N]
+// in x.dtype (float32 stays float32). Only codecs with an instantiated
+// expert-sum kernel are accepted (q2_k); K must be whole super-blocks and N
+// a multiple of 4. Metal-only.
+mx::array gather_qmv_expert_sum(
+    mx::array x,
+    mx::array w,
+    mx::array scales,
+    const std::string& kquant_type,
+    mx::array ids,
+    mx::StreamOrDevice s = {});
+
 // Vector scaled-dot-product attention for large head dims (e.g. 512) that stock
 // MLX's fused vector allowlist {64,96,128,256} excludes. q/k/v are float
 // [B, n_q_heads, qL, D] / [B, n_kv_heads, kL, D] (GQA: n_q_heads % n_kv_heads
@@ -1029,6 +1076,84 @@ class KQuantGatherQMMSortedSwiglu : public mx::Primitive {
   int bits_;
   int gate_out_;
   float swiglu_limit_;
+};
+
+// Decode-shaped fused gate/up + SwiGLU + route-weight matvec (see
+// gather_qmv_pair_swiglu). Inference-only: jvp/vjp/vmap inherit the
+// base-class throwing defaults. eval_cpu throws (Metal-only kernel).
+class KQuantGatherQMVPairSwiglu : public mx::Primitive {
+ public:
+  explicit KQuantGatherQMVPairSwiglu(
+      mx::Stream stream,
+      std::string kquant_type,
+      int group_size,
+      int bits,
+      int gate_out,
+      float swiglu_limit)
+      : mx::Primitive(stream),
+        kquant_type_(std::move(kquant_type)),
+        group_size_(group_size),
+        bits_(bits),
+        gate_out_(gate_out),
+        swiglu_limit_(swiglu_limit) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantGatherQMVPairSwiglu";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  std::string kquant_type_;
+  int group_size_;
+  int bits_;
+  int gate_out_;
+  float swiglu_limit_;
+};
+
+// Decode-shaped down matvec with the in-kernel sum over the token's routed
+// experts (see gather_qmv_expert_sum). Inference-only: jvp/vjp/vmap inherit
+// the base-class throwing defaults. eval_cpu throws (Metal-only kernel).
+class KQuantGatherQMVExpertSum : public mx::Primitive {
+ public:
+  explicit KQuantGatherQMVExpertSum(
+      mx::Stream stream,
+      std::string kquant_type,
+      int group_size,
+      int bits)
+      : mx::Primitive(stream),
+        kquant_type_(std::move(kquant_type)),
+        group_size_(group_size),
+        bits_(bits) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantGatherQMVExpertSum";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  std::string kquant_type_;
+  int group_size_;
+  int bits_;
 };
 
 // Gather (MoE) quantized matmul. vjp implements only the gradient wrt x (a

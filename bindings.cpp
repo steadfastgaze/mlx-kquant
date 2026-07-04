@@ -719,6 +719,98 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "gather_qmv_pair_swiglu",
+      &mlx_kquant::gather_qmv_pair_swiglu,
+      "x"_a,
+      "w"_a,
+      "scales"_a,
+      "kquant_type"_a,
+      "ids"_a,
+      "route_weights"_a,
+      "gate_out"_a,
+      "swiglu_limit"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Decode-shaped fused gate/up + SwiGLU matvec over a combined gate/up
+        mixture-of-experts weight stack, with the per-expert route weight
+        baked into the stored intermediate. One dispatch computes every
+        routed expert's activation row for a single token.
+
+        For each expert slot ``b``: ``gate = x[0] @
+        dequant(w[ids[b]])[0:gate_out].T``, ``up = x[0] @
+        dequant(w[ids[b]])[gate_out:].T`` on float32 accumulators, and the
+        output row is ``silu(gate) * up * route_weights[b]`` computed in
+        float32 (``swiglu_limit > 0`` clamps the gate from above only and up
+        symmetrically first, the DSV4 SwiGLU contract).
+
+        Args:
+            x (array): float16/bfloat16/float32 activation row [1, K],
+                row-contiguous.
+            w (array): uint8 K-quant wire bytes shaped
+                (n_experts, 2 * gate_out, bytes_per_row); each expert stacks
+                its gate rows first, then its up rows.
+            scales (array): vestigial placeholder; ignored by the kernel.
+            kquant_type (str): codec name; only codecs with an instantiated
+                pair kernel are accepted (``"iq2_xxs"``).
+            ids (array): uint32 [B] expert index per routed slot, values in
+                [0, n_experts).
+            route_weights (array): float32 [B] route weight per slot, baked
+                into the stored intermediate.
+            gate_out (int): output features of the gate half; w must hold
+                exactly ``2 * gate_out`` rows per expert, and gate_out must
+                be a multiple of 4 (the qmv row block).
+            swiglu_limit (float): activation clamp. Positive values clamp the
+                gate to at most ``swiglu_limit`` and the up value to
+                ``[-swiglu_limit, swiglu_limit]``; values <= 0 disable the
+                clamps.
+
+        Returns:
+            array: the fused intermediate [B, gate_out] in x.dtype (float32
+            stays float32; no bfloat16 promotion on this decode path).
+            Numerically equivalent but not bit-identical to the unfused
+            gather_qmm + activation + scale composition (the epilogue reads
+            the float32 accumulators directly).
+      )");
+
+  m.def(
+      "gather_qmv_expert_sum",
+      &mlx_kquant::gather_qmv_expert_sum,
+      "x"_a,
+      "w"_a,
+      "scales"_a,
+      "kquant_type"_a,
+      "ids"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Decode-shaped down matvec with the sum over the token's routed
+        experts fused into the kernel: ``out[0, n] = sum_b x[b] @
+        dequant(w[ids[b]])[n]``, each output element accumulating every
+        expert's contribution in float32 in slot order. The separate
+        route-weighted-sum reduction disappears; x rows are expected to
+        carry the route weights already (gather_qmv_pair_swiglu bakes them).
+
+        Args:
+            x (array): float16/bfloat16/float32 activations [B, K],
+                row-contiguous, one row per routed slot.
+            w (array): uint8 K-quant wire bytes shaped
+                (n_experts, N, bytes_per_row); N must be a multiple of 4
+                (the qmv row block).
+            scales (array): vestigial placeholder; ignored by the kernel.
+            kquant_type (str): codec name; only codecs with an instantiated
+                expert-sum kernel are accepted (``"q2_k"``).
+            ids (array): uint32 [B] expert index per x row, values in
+                [0, n_experts).
+
+        Returns:
+            array: the summed result [1, N] in x.dtype (float32 stays
+            float32). Numerically equivalent but not bit-identical to the
+            per-expert gather_qmm + sum composition (the cross-expert sum
+            runs on the float32 accumulators inside the kernel).
+      )");
+
+  m.def(
       "quantize",
       &mlx_kquant::quantize,
       "w"_a,

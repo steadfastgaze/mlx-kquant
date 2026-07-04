@@ -717,6 +717,222 @@ mx::array gather_qmm_sorted_swiglu(
       {std::move(x_c), std::move(w_c), std::move(scales), std::move(ids_c)});
 }
 
+mx::array gather_qmv_pair_swiglu(
+    mx::array x,
+    mx::array w,
+    mx::array scales,
+    const std::string& kquant_type,
+    mx::array ids,
+    mx::array route_weights,
+    int gate_out,
+    float swiglu_limit,
+    mx::StreamOrDevice s_) {
+  // Only the codecs with an instantiated pair kernel are accepted; anything
+  // else fails closed here rather than at kernel lookup.
+  if (kquant_type != "iq2_xxs") {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmv_pair_swiglu] no pair+SwiGLU matvec kernel "
+        "for codec '" +
+        kquant_type + "' (instantiated: iq2_xxs).");
+  }
+  const KQuantCodec* codec = codec_by_name(kquant_type);
+  if (w.dtype() != mx::uint8) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmv_pair_swiglu] w must be uint8 (raw GGUF wire "
+        "bytes).");
+  }
+  auto dt = x.dtype();
+  if (dt != mx::float16 && dt != mx::bfloat16 && dt != mx::float32) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmv_pair_swiglu] x must be float16, bfloat16, or "
+        "float32.");
+  }
+  if (x.ndim() != 2 || x.shape(0) != 1) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmv_pair_swiglu] x must be one activation row "
+        << "[1, K] but got shape " << x.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (w.ndim() != 3) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmv_pair_swiglu] w must be 3-D "
+        << "[n_experts, 2 * gate_out, bytes_per_row] but got shape "
+        << w.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (ids.dtype() != mx::uint32 || ids.ndim() != 1 || ids.shape(0) < 1) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmv_pair_swiglu] ids must be a non-empty 1-D "
+        << "uint32 array but got " << ids.shape() << " " << ids.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (route_weights.dtype() != mx::float32 || route_weights.ndim() != 1 ||
+      route_weights.shape(0) != ids.shape(0)) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmv_pair_swiglu] route_weights must be 1-D "
+        << "float32 with one weight per id (" << ids.shape(0)
+        << ") but got shape " << route_weights.shape() << " "
+        << route_weights.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (gate_out <= 0 || w.shape(-2) != 2 * gate_out) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmv_pair_swiglu] w must stack gate rows then "
+        << "up rows per expert: expected " << 2 * gate_out
+        << " rows for gate_out " << gate_out << " but w has " << w.shape(-2)
+        << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (gate_out % 4 != 0) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmv_pair_swiglu] gate_out (" << gate_out
+        << ") must be a multiple of 4 (the qmv row block).";
+    throw std::invalid_argument(msg.str());
+  }
+
+  // Expand w's quantized geometry from the codec block layout, exactly as
+  // gather_qmm_sorted_swiglu does.
+  int w_bytes_per_row = w.shape(-1);
+  if (w_bytes_per_row % codec->bytes_per_block != 0) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmv_pair_swiglu] KQuant weight last dim ("
+        << w_bytes_per_row << " bytes) is not a whole number of "
+        << codec->bytes_per_block << "-byte " << codec->name << " blocks.";
+    throw std::invalid_argument(msg.str());
+  }
+  int K = (w_bytes_per_row / codec->bytes_per_block) * codec->weights_per_block;
+  if (K != x.shape(-1)) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmv_pair_swiglu] x last dim (" << x.shape(-1)
+        << ") does not match the expanded quantized weight inner dim (" << K
+        << ") for codec '" << codec->name << "'.";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto s = mx::to_stream(s_);
+
+  // Row-contiguize at the op level so eval_gpu can assume dense inputs (the
+  // kernel indexes x[k], w[((id * 2 * gate_out) + n) * row_bytes], and reads
+  // ids / route_weights as flat rows).
+  auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
+  auto w_c = w.flags().row_contiguous ? w : mx::contiguous(w, false, s);
+  auto ids_c = ids.flags().row_contiguous ? ids : mx::contiguous(ids, false, s);
+  auto rw_c = route_weights.flags().row_contiguous
+      ? route_weights
+      : mx::contiguous(route_weights, false, s);
+
+  mx::Shape out_shape = {ids.shape(0), gate_out};
+
+  return mx::array(
+      std::move(out_shape),
+      dt,
+      std::make_shared<KQuantGatherQMVPairSwiglu>(
+          s,
+          kquant_type,
+          codec->weights_per_block,
+          codec->bits,
+          gate_out,
+          swiglu_limit),
+      {std::move(x_c),
+       std::move(w_c),
+       std::move(scales),
+       std::move(ids_c),
+       std::move(rw_c)});
+}
+
+mx::array gather_qmv_expert_sum(
+    mx::array x,
+    mx::array w,
+    mx::array scales,
+    const std::string& kquant_type,
+    mx::array ids,
+    mx::StreamOrDevice s_) {
+  // Only the codecs with an instantiated expert-sum kernel are accepted;
+  // anything else fails closed here rather than at kernel lookup.
+  if (kquant_type != "q2_k") {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmv_expert_sum] no expert-sum matvec kernel for "
+        "codec '" +
+        kquant_type + "' (instantiated: q2_k).");
+  }
+  const KQuantCodec* codec = codec_by_name(kquant_type);
+  if (w.dtype() != mx::uint8) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmv_expert_sum] w must be uint8 (raw GGUF wire "
+        "bytes).");
+  }
+  auto dt = x.dtype();
+  if (dt != mx::float16 && dt != mx::bfloat16 && dt != mx::float32) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmv_expert_sum] x must be float16, bfloat16, or "
+        "float32.");
+  }
+  if (x.ndim() != 2) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmv_expert_sum] x must be 2-D [B, K] but got "
+        << "shape " << x.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (w.ndim() != 3) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmv_expert_sum] w must be 3-D "
+        << "[n_experts, N, bytes_per_row] but got shape " << w.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (ids.dtype() != mx::uint32 || ids.ndim() != 1 ||
+      ids.shape(0) != x.shape(0)) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmv_expert_sum] ids must be 1-D uint32 with "
+        << "one id per x row (" << x.shape(0) << ") but got "
+        << ids.shape() << " " << ids.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  int N = w.shape(-2);
+  if (N % 4 != 0) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmv_expert_sum] N (" << N
+        << ") must be a multiple of 4 (the qmv row block).";
+    throw std::invalid_argument(msg.str());
+  }
+
+  // Expand w's quantized geometry from the codec block layout, exactly as
+  // gather_qmm_sorted does.
+  int w_bytes_per_row = w.shape(-1);
+  if (w_bytes_per_row % codec->bytes_per_block != 0) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmv_expert_sum] KQuant weight last dim ("
+        << w_bytes_per_row << " bytes) is not a whole number of "
+        << codec->bytes_per_block << "-byte " << codec->name << " blocks.";
+    throw std::invalid_argument(msg.str());
+  }
+  int K = (w_bytes_per_row / codec->bytes_per_block) * codec->weights_per_block;
+  if (K != x.shape(-1)) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmv_expert_sum] x last dim (" << x.shape(-1)
+        << ") does not match the expanded quantized weight inner dim (" << K
+        << ") for codec '" << codec->name << "'.";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto s = mx::to_stream(s_);
+
+  // Row-contiguize at the op level so eval_gpu can assume dense inputs (the
+  // kernel indexes x[b * K + k], w[((id * N) + n) * row_bytes], and reads
+  // ids as a flat row).
+  auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
+  auto w_c = w.flags().row_contiguous ? w : mx::contiguous(w, false, s);
+  auto ids_c = ids.flags().row_contiguous ? ids : mx::contiguous(ids, false, s);
+
+  mx::Shape out_shape = {1, N};
+
+  return mx::array(
+      std::move(out_shape),
+      dt,
+      std::make_shared<KQuantGatherQMVExpertSum>(
+          s, kquant_type, codec->weights_per_block, codec->bits),
+      {std::move(x_c), std::move(w_c), std::move(scales), std::move(ids_c)});
+}
+
 std::vector<mx::array> quantize(
     const mx::array& w,
     const std::string& kquant_type,

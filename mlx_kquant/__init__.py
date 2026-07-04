@@ -16,6 +16,10 @@ Current API:
     expert ids, row ranges derived in-kernel (no host descriptor table).
   * ``gather_qmm_sorted_swiglu`` - gather_qmm_sorted over a combined gate/up
     expert stack with the SwiGLU fused into the kernel epilogue.
+  * ``gather_qmv_pair_swiglu`` - decode-shaped fused gate/up + SwiGLU matvec
+    with per-expert route weights baked into the intermediate.
+  * ``gather_qmv_expert_sum`` - decode-shaped down matvec summing the token's
+    routed experts inside the kernel.
   * ``quantize`` - encode a float tensor into K-quant wire bytes (CPU or Metal).
   * ``load_gguf`` - load a GGUF file's tensors + metadata (C++ mmap memcpy).
 """
@@ -36,9 +40,11 @@ from ._ext import (  # noqa: F401
     gather_qmm_sorted,
     gather_qmm_sorted_swiglu,
     gather_qmv_bias,
+    gather_qmv_expert_sum,
     gather_qmv_kq,
     gather_qmv_mix_kq,
     gather_qmv_mix_ns_kq,
+    gather_qmv_pair_swiglu,
     load_gguf,
     metallib_dir,
     metallib_loads,
@@ -70,9 +76,11 @@ __all__ = [
     "gather_qmm_sorted",
     "gather_qmm_sorted_swiglu",
     "gather_qmv_bias",
+    "gather_qmv_expert_sum",
     "gather_qmv_kq",
     "gather_qmv_mix_kq",
     "gather_qmv_mix_ns_kq",
+    "gather_qmv_pair_swiglu",
     "load_gguf",
     "metallib_dir",
     "metallib_loads",
