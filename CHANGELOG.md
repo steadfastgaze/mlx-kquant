@@ -7,6 +7,23 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `sdpa_vector` attention sinks and boolean masks, with a wide-MQA dispatch
+  shape for single-KV-head decode (one query head block per simdgroup).
+- **Segmented MoE quantized GEMM** (`kq.gather_qmm_segments`): bulk routed
+  prefill over a descriptor of contiguous expert row ranges, float32 I/O and
+  accumulate on the GGUF wire bytes.
+- **Sorted-ids MoE quantized GEMM** (`kq.gather_qmm_sorted`): the segmented
+  GEMM with the per-expert row ranges derived in-kernel from sorted expert
+  ids, removing the host-side descriptor pass.
+- Device-A fragment tiles for the segments/sorted GEMM family
+  (`KQ_SEG_TILE`, default `t48x128x16a`): simdgroup-matrix staging of the
+  dequantized A fragment; `fh`/`ah` half-staging variants remain opt-in.
+- **Fused SwiGLU routed GEMM** (`kq.gather_qmm_sorted_swiglu`): combined
+  gate/up expert stacks activate in the epilogue, halving the bulk routed
+  dispatch count for GLU experts.
+- Register-direct dequant body for the segments/sorted GEMM family as a
+  parked opt-in (`KQ_SEG_TILE=...dr`); measured slower than threadgroup
+  staging on M3, kept for newer-architecture probes.
 - **Decode-shaped routed-MoE matvec pair** (`kq.gather_qmv_pair_swiglu`,
   `kq.gather_qmv_expert_sum`): one dispatch computes every routed expert's
   fused gate/up + SwiGLU activation row for a single token with the route
@@ -17,6 +34,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   but not bit-identical to the unfused gather_qmm composition. Instantiated
   for the served DS4 decode codec pair only; other codecs fail closed at the
   op level.
+
+### Changed
+- SwiGLU epilogues pin `metal::precise::exp`; the softmax fast::exp sites
+  carry an annotation for why the fast form stays.
 
 
 ## [0.3.1]
