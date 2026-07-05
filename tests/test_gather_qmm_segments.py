@@ -261,7 +261,7 @@ _HALF_TILE_CHECK = textwrap.dedent(
 )
 
 
-@pytest.mark.parametrize("tile", ["t32x64x64h", "t64x64x32h"])
+@pytest.mark.parametrize("tile", ["t32x64x64h", "t64x64x32h", "t48x128x16ah"])
 def test_gather_qmm_segments_half_staging_optin(tile):
     if mx.default_device() == mx.cpu:
         pytest.skip("half-staging opt-in is a GPU kernel path")
@@ -274,3 +274,75 @@ def test_gather_qmm_segments_half_staging_optin(tile):
     )
     assert proc.returncode == 0, f"{tile}: {proc.stderr}"
     assert "HALF_OK" in proc.stdout, f"{tile}: {proc.stdout}\n{proc.stderr}"
+
+
+# The float-I/O half-staging opt-in (KQ_SEG_TILE suffix fh) keeps float32
+# rows, accumulators, and output while rounding both operand tiles through
+# half, so it holds the same half-precision bound as the h tiles but must
+# preserve the float32 I/O dtype end to end.
+_FHALF_TILE_CHECK = textwrap.dedent(
+    """
+    import numpy as np
+    import mlx.core as mx
+    import mlx_kquant as kq
+
+    rng = np.random.default_rng(0)
+    K, N, E = 512, 256, 6
+    imat = mx.array((np.abs(rng.standard_normal(K)) + 0.1).astype(np.float32))
+    wq = []
+    for _ in range(E):
+        w_np = (rng.standard_normal((N, K)) * 0.1).astype(np.float32)
+        q, _ = kq.quantize(mx.array(w_np), "iq2_xxs", imatrix=imat)
+        mx.eval(q)
+        wq.append(np.ascontiguousarray(np.array(q).astype(np.uint8)))
+    w = mx.array(np.stack(wq))
+    scales = mx.zeros((1,), dtype=mx.uint8)
+    spec = [(0, 1), (1, 3), (2, 37), (3, 90), (4, 250)]
+    rows = []
+    start = 0
+    for e, c in spec:
+        rows.append((e, start, c))
+        start += c
+    S = start
+    seg = mx.array(np.array(rows, dtype=np.uint32))
+    ids = np.concatenate([np.full(c, e, np.uint32) for e, _s, c in np.array(seg)])
+    x_np = (rng.standard_normal((S, K)) * 0.1).astype(np.float32)
+    x = mx.array(x_np)
+    out = kq.gather_qmm_segments(x, w, scales, "iq2_xxs", seg)
+    out_sorted = kq.gather_qmm_sorted(x, w, scales, "iq2_xxs", mx.array(ids))
+    mx.eval(out, out_sorted)
+    assert out.dtype == mx.float32, out.dtype
+    assert out_sorted.dtype == mx.float32, out_sorted.dtype
+    got = np.array(out)
+    assert np.array_equal(got, np.array(out_sorted)), "segments/sorted diverge"
+    deq = [
+        np.array(kq.dequantize(mx.array(wq[e]), scales, "iq2_xxs", mx.float32))
+        for e in range(E)
+    ]
+    ref = np.zeros((S, N), np.float32)
+    for e, st, c in np.array(seg):
+        ref[st : st + c] = x_np[st : st + c] @ deq[e].T
+    d = np.abs(got - ref)
+    rel = float((d / (np.abs(ref) + 1e-3)).max())
+    abs_max = float(d.max())
+    assert rel < 5e-2 or abs_max < 1e-2, f"fhalf rel={rel:.3e} abs={abs_max:.3e}"
+    print("FHALF_OK", rel)
+    """
+)
+
+
+@pytest.mark.parametrize(
+    "tile", ["t64x64x32fh", "t32x64x64fh", "t64x64x64fh", "t48x128x16ah"]
+)
+def test_gather_qmm_segments_fhalf_staging_optin(tile):
+    if mx.default_device() == mx.cpu:
+        pytest.skip("half-staging opt-in is a GPU kernel path")
+    env = dict(os.environ, KQ_SEG_TILE=tile)
+    proc = subprocess.run(
+        [sys.executable, "-c", _FHALF_TILE_CHECK],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, f"{tile}: {proc.stderr}"
+    assert "FHALF_OK" in proc.stdout, f"{tile}: {proc.stdout}\n{proc.stderr}"

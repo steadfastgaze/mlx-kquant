@@ -512,6 +512,102 @@ mx::array gather_qmm_segments(
       {std::move(x_c), std::move(w_c), std::move(scales), std::move(seg_c)});
 }
 
+mx::array gather_qmm_sorted(
+    mx::array x,
+    mx::array w,
+    mx::array scales,
+    const std::string& kquant_type,
+    mx::array sorted_ids,
+    bool transpose,
+    mx::StreamOrDevice s_) {
+  if (!transpose) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmm_sorted] only transpose=True is supported "
+        "(the MoE weight layout [n_experts, N, bytes_per_row]).");
+  }
+  if (w.dtype() != mx::uint8) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmm_sorted] w must be uint8 (raw GGUF wire "
+        "bytes).");
+  }
+  const KQuantCodec* codec = codec_by_name(kquant_type);
+  if (codec == nullptr) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmm_sorted] Unknown kquant_type: '" + kquant_type +
+        "'.");
+  }
+  auto dt = x.dtype();
+  if (dt != mx::float16 && dt != mx::bfloat16 && dt != mx::float32) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmm_sorted] x must be float16, bfloat16, or "
+        "float32.");
+  }
+  if (x.ndim() != 2) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmm_sorted] x must be 2-D [S, K] but got shape "
+        << x.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (w.ndim() != 3) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmm_sorted] w must be 3-D "
+        << "[n_experts, N, bytes_per_row] but got shape " << w.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (sorted_ids.dtype() != mx::uint32) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmm_sorted] sorted_ids must be uint32.");
+  }
+  if (sorted_ids.ndim() != 1 || sorted_ids.shape(0) != x.shape(0)) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmm_sorted] sorted_ids must be 1-D with one id "
+        << "per x row (" << x.shape(0) << ") but got shape "
+        << sorted_ids.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  // Expand w's quantized geometry from the codec block layout, exactly as
+  // gather_qmm_segments does.
+  int w_bytes_per_row = w.shape(-1);
+  if (w_bytes_per_row % codec->bytes_per_block != 0) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmm_sorted] KQuant weight last dim ("
+        << w_bytes_per_row << " bytes) is not a whole number of "
+        << codec->bytes_per_block << "-byte " << codec->name << " blocks.";
+    throw std::invalid_argument(msg.str());
+  }
+  int K = (w_bytes_per_row / codec->bytes_per_block) * codec->weights_per_block;
+  if (K != x.shape(-1)) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmm_sorted] x last dim (" << x.shape(-1)
+        << ") does not match the expanded quantized weight inner dim (" << K
+        << ") for codec '" << codec->name << "'.";
+    throw std::invalid_argument(msg.str());
+  }
+
+  int N = w.shape(-2);
+
+  auto s = mx::to_stream(s_);
+
+  // Row-contiguize x / w / sorted_ids at the op level so eval_gpu can assume
+  // dense inputs (the kernel indexes x[row*K], w[(e*N+n)*row_bytes], and
+  // binary-searches sorted_ids as a flat [S] uint32 buffer).
+  auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
+  auto w_c = w.flags().row_contiguous ? w : mx::contiguous(w, false, s);
+  auto ids_c = sorted_ids.flags().row_contiguous
+      ? sorted_ids
+      : mx::contiguous(sorted_ids, false, s);
+
+  mx::Shape out_shape = {x.shape(0), N};
+
+  return mx::array(
+      std::move(out_shape),
+      dt,
+      std::make_shared<KQuantGatherQMMSorted>(
+          s, kquant_type, codec->weights_per_block, codec->bits),
+      {std::move(x_c), std::move(w_c), std::move(scales), std::move(ids_c)});
+}
+
 std::vector<mx::array> quantize(
     const mx::array& w,
     const std::string& kquant_type,

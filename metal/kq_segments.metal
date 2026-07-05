@@ -13,60 +13,107 @@
 // codec, I/O type token and tile tag so eval_gpu can build it from
 // kquant_type + x.dtype() + the selected tile. WM=WN=2 -> 128 threads. StageT
 // is the threadgroup tile precision (float for the f32-decode contract; the
-// I/O type for the half-staging opt-in).
-#define instantiate_segments(codec, ext, type, bm, bn, bk, staget, tag) \
-  instantiate_kernel(                                                    \
-      "kquant_" #codec "_gather_qmm_segments_" #type "_" #tag,           \
-      kq_gather_qmm_segments_impl,                                       \
-      type,                                                              \
-      ext,                                                               \
-      bm,                                                                \
-      bn,                                                                \
-      bk,                                                                \
-      2,                                                                 \
-      2,                                                                 \
-      staget)
+// I/O type for the half-staging opt-in). The trailing flag selects the GEMM
+// body: false = both operands staged (steel BlockMMA), true = device-A
+// (weight tile only, unpadded; see kq_segments.h). Every tile is instantiated
+// for both entry points: the descriptor-table kernel (gather_qmm_segments)
+// and the binary-search kernel over device-sorted ids (gather_qmm_sorted),
+// which share the GEMM bodies.
+#define instantiate_segments(codec, ext, type, bm, bn, bk, staget, deva, tag) \
+  instantiate_kernel(                                                          \
+      "kquant_" #codec "_gather_qmm_segments_" #type "_" #tag,                 \
+      kq_gather_qmm_segments_impl,                                             \
+      type,                                                                    \
+      ext,                                                                     \
+      bm,                                                                      \
+      bn,                                                                      \
+      bk,                                                                      \
+      2,                                                                       \
+      2,                                                                       \
+      staget,                                                                  \
+      deva)                                                                    \
+  instantiate_kernel(                                                          \
+      "kquant_" #codec "_gather_qmm_sorted_" #type "_" #tag,                   \
+      kq_gather_qmm_sorted_impl,                                               \
+      type,                                                                    \
+      ext,                                                                     \
+      bm,                                                                      \
+      bn,                                                                      \
+      bk,                                                                      \
+      2,                                                                       \
+      2,                                                                       \
+      staget,                                                                  \
+      deva)
 
 // Tile variants (tag matches KQ_SEG_TILE selection in eval_gpu). The default
-// is 48x64x16; the others are A/B levers. Every float-staging tile stages float
-// (StageT=float), the f32-decode contract that the dq_f32 parity tests require.
-// BK=16 is the minimum tile depth (the weight decode helper works on 16-weight
-// chunks); the small-BK tiles shrink the two staged float tiles to lift
-// occupancy while keeping the f32 decode. BM in {32,48,64} at BK=16 trades
-// activation-tile footprint against how many row-chunks a segment splits into.
-#define instantiate_segments_type(codec, ext, type)                    \
-  instantiate_segments(codec, ext, type, 64, 64, 32, float, t64x64x32) \
-  instantiate_segments(codec, ext, type, 32, 64, 64, float, t32x64x64) \
-  instantiate_segments(codec, ext, type, 64, 32, 64, float, t64x32x64) \
-  instantiate_segments(codec, ext, type, 64, 64, 16, float, t64x64x16) \
-  instantiate_segments(codec, ext, type, 32, 64, 16, float, t32x64x16) \
-  instantiate_segments(codec, ext, type, 48, 64, 16, float, t48x64x16) \
-  instantiate_segments(codec, ext, type, 128, 64, 32, float, t128x64x32)
-
-#define instantiate_segments_type_f32(codec, ext)                       \
-  instantiate_segments(codec, ext, float, 64, 64, 32, float, t64x64x32) \
-  instantiate_segments(codec, ext, float, 32, 64, 64, float, t32x64x64) \
-  instantiate_segments(codec, ext, float, 64, 32, 64, float, t64x32x64) \
-  instantiate_segments(codec, ext, float, 64, 64, 16, float, t64x64x16) \
-  instantiate_segments(codec, ext, float, 32, 64, 16, float, t32x64x16) \
-  instantiate_segments(codec, ext, float, 48, 64, 16, float, t48x64x16) \
-  instantiate_segments(codec, ext, float, 128, 64, 32, float, t128x64x32)
+// is t48x128x16a: the device-A body (activation fragments read from device
+// rows, weight tile unpadded), BN=128 to halve the per-row-chunk activation
+// re-reads, BK=16 to keep the staged weight tile small (8 KB). On the sorted
+// MoE bulk-prefill shape (S=23058, K=N=4096, E=256) it measures 89.3-91.0 ms
+// for iq2_xxs against 105.6-106.5 ms for the best staged tile (t48x64x16,
+// the previous default), byte-equal outputs, alternating matched arms. The
+// sweep that produced it also ruled out: register-prefetch and
+// double-buffered staging (register pressure and footprint regressed every
+// tile they touched), 256-thread simdgroup layouts, BM=96 (halved dequant
+// passes, register spill), BK=32 paired decode (halved decode headers,
+// register spill), and a stashed-register paired decode. Every rejected
+// variant was bit-identical; they lost on speed only.
+//
+// The staged float tiles stay as KQ_SEG_TILE A/B levers (t48x64x16 pins the
+// previous default). BK=16 is the minimum tile depth (the weight decode
+// helper works on 16-weight chunks). Only BN (the n-tile width) reaches the
+// host - it sizes the grid; BM/BK and the body flag are internal to the
+// kernel. The segments and sorted kernels share the selection so a
+// segments/sorted parity pair always runs the same tile.
+#define instantiate_segments_type(codec, ext, type)                              \
+  instantiate_segments(codec, ext, type, 48, 128, 16, float, true, t48x128x16a)  \
+  instantiate_segments(codec, ext, type, 64, 64, 32, float, false, t64x64x32)    \
+  instantiate_segments(codec, ext, type, 32, 64, 64, float, false, t32x64x64)    \
+  instantiate_segments(codec, ext, type, 64, 32, 64, float, false, t64x32x64)    \
+  instantiate_segments(codec, ext, type, 64, 64, 16, float, false, t64x64x16)    \
+  instantiate_segments(codec, ext, type, 32, 64, 16, float, false, t32x64x16)    \
+  instantiate_segments(codec, ext, type, 48, 64, 16, float, false, t48x64x16)    \
+  instantiate_segments(codec, ext, type, 128, 64, 32, float, false, t128x64x32)
 
 // Half-staging opt-in (tag suffix h). Weights round through the I/O half type
 // before the multiply, so these trade the f32-decode contract for a smaller
 // threadgroup footprint (better occupancy). Selected only via KQ_SEG_TILE; the
 // default dispatch never picks them, so the parity tests keep the float tiles.
-#define instantiate_segments_type_half(codec, ext, type)              \
-  instantiate_segments(codec, ext, type, 64, 64, 32, type, t64x64x32h) \
-  instantiate_segments(codec, ext, type, 32, 64, 64, type, t32x64x64h) \
-  instantiate_segments(codec, ext, type, 64, 64, 64, type, t64x64x64h)
+#define instantiate_segments_type_half(codec, ext, type)                     \
+  instantiate_segments(codec, ext, type, 64, 64, 32, type, false, t64x64x32h) \
+  instantiate_segments(codec, ext, type, 32, 64, 64, type, false, t32x64x64h) \
+  instantiate_segments(codec, ext, type, 64, 64, 64, type, false, t64x64x64h) \
+  instantiate_segments(codec, ext, type, 48, 128, 16, half, true, t48x128x16ah)
+
+// Half-staging with float32 I/O (tag suffix fh). Activations and weights
+// round through half in the threadgroup tiles; I/O rows, the simdgroup
+// accumulators, and the output stay float32. This reproduces the DS4-c Metal
+// MoE contract exactly (float device rows, half operand fragments, float
+// accumulate, float output), so a caller whose rows are float32 can gate the
+// half-precision-operand question without also rounding its I/O.
+//
+// t48x128x16ah is the device-A body with only the weight tile in half: the
+// activation fragments still read float straight from device rows, and the
+// B-tile load casts half back to float fragments, so the MMA itself is
+// unchanged and the only numeric effect is the weight decode rounding
+// through half (measured rel ~2e-4 against an f64 reference, no boundary
+// anomalies). The win is the halved weight-tile footprint and staging
+// traffic: 136.7-137.6 ms against the float default's 143.7-144.1 ms on the
+// sorted MoE bulk-prefill pair (iq2_xxs gate/up plus q2_k down, S=23058,
+// alternating matched arms). Selected only via KQ_SEG_TILE.
+#define instantiate_segments_type_fhalf(codec, ext)                            \
+  instantiate_segments(codec, ext, float, 64, 64, 32, half, false, t64x64x32fh) \
+  instantiate_segments(codec, ext, float, 32, 64, 64, half, false, t32x64x64fh) \
+  instantiate_segments(codec, ext, float, 64, 64, 64, half, false, t64x64x64fh) \
+  instantiate_segments(codec, ext, float, 48, 128, 16, half, true, t48x128x16ah)
 
 #define instantiate_segments_all(codec, ext)                     \
   instantiate_segments_type(codec, ext, float16_t)               \
   instantiate_segments_type(codec, ext, bfloat16_t)              \
-  instantiate_segments_type_f32(codec, ext)                      \
+  instantiate_segments_type(codec, ext, float)                   \
   instantiate_segments_type_half(codec, ext, float16_t)          \
-  instantiate_segments_type_half(codec, ext, bfloat16_t)
+  instantiate_segments_type_half(codec, ext, bfloat16_t)         \
+  instantiate_segments_type_fhalf(codec, ext)
 
 // K-quants (256-weight super-blocks).
 instantiate_segments_all(q2_k, KqQ2_KExt)

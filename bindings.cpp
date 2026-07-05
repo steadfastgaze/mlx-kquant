@@ -629,6 +629,43 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "gather_qmm_sorted",
+      &mlx_kquant::gather_qmm_sorted,
+      "x"_a,
+      "w"_a,
+      "scales"_a,
+      "kquant_type"_a,
+      "sorted_ids"_a,
+      "transpose"_a = true,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Sorted-ids segmented (mixture-of-experts) quantized GEMM with the row
+        ranges derived in-kernel: gather_qmm_segments without the host-built
+        descriptor table.
+
+        Args:
+            x (array): float16/bfloat16/float32 activations [S, K],
+                row-contiguous. The sorted token-expert pair rows.
+            w (array): uint8 K-quant wire bytes shaped
+                (n_experts, N, bytes_per_row) - the transpose=True MoE layout,
+                the same gather_qmm_segments takes.
+            scales (array): vestigial placeholder; ignored by the kernel.
+            kquant_type (str): codec name, e.g. ``"iq2_xxs"``, ``"q2_k"``.
+            sorted_ids (array): device uint32 [S] expert index per x row,
+                ascending (equal ids contiguous), values in [0, n_experts).
+                Each threadgroup binary-searches its expert's row range, so the
+                ids are never read on the host and the call queues with zero
+                synchronization.
+            transpose (bool): must be True (only the MoE transpose shape is
+                supported).
+
+        Returns:
+            array: the segmented matmul result [S, N] (x.dtype), bit-identical
+            to gather_qmm_segments with the equivalent host-built table.
+      )");
+
+  m.def(
       "quantize",
       &mlx_kquant::quantize,
       "w"_a,

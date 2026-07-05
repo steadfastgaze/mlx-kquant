@@ -125,6 +125,25 @@ mx::array gather_qmm_segments(
     bool transpose = true,
     mx::StreamOrDevice s = {});
 
+// Sorted-ids variant of gather_qmm_segments with no host-built descriptor
+// table. `sorted_ids` is a device uint32 [S] array giving each x row's expert
+// index, ascending (equal ids contiguous); each threadgroup derives its row
+// range in-kernel with a binary search, so no segment structure ever touches
+// the host and the call queues into a lazy graph with zero synchronization.
+// Ids must lie in [0, n_experts); rows whose id is out of that range are
+// never written. Everything else (shapes, dtypes, the f32 decode/accumulate
+// contract, output dtype) matches gather_qmm_segments, and for any sorted
+// input the output is bit-identical to gather_qmm_segments called with the
+// equivalent host-built table. Metal-only.
+mx::array gather_qmm_sorted(
+    mx::array x,
+    mx::array w,
+    mx::array scales,
+    const std::string& kquant_type,
+    mx::array sorted_ids,
+    bool transpose = true,
+    mx::StreamOrDevice s = {});
+
 // Vector scaled-dot-product attention for large head dims (e.g. 512) that stock
 // MLX's fused vector allowlist {64,96,128,256} excludes. q/k/v are float
 // [B, n_q_heads, qL, D] / [B, n_kv_heads, kL, D] (GQA: n_q_heads % n_kv_heads
@@ -896,6 +915,43 @@ class KQuantGatherQMMSegments : public mx::Primitive {
 
   const char* name() const override {
     return "KQuantGatherQMMSegments";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  std::string kquant_type_;
+  int group_size_;
+  int bits_;
+};
+
+// Sorted-ids segmented (MoE) quantized GEMM: the gather_qmm_segments math with
+// the descriptor table replaced by an in-kernel binary search over the sorted
+// per-row expert ids. Inference-only: jvp/vjp/vmap inherit the base-class
+// throwing defaults. eval_cpu throws (Metal-only kernel).
+class KQuantGatherQMMSorted : public mx::Primitive {
+ public:
+  explicit KQuantGatherQMMSorted(
+      mx::Stream stream,
+      std::string kquant_type,
+      int group_size,
+      int bits)
+      : mx::Primitive(stream),
+        kquant_type_(std::move(kquant_type)),
+        group_size_(group_size),
+        bits_(bits) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantGatherQMMSorted";
   }
   bool is_equivalent(const mx::Primitive& other) const override;
 
