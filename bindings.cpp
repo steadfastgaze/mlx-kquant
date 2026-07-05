@@ -591,6 +591,44 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "gather_qmm_segments",
+      &mlx_kquant::gather_qmm_segments,
+      "x"_a,
+      "w"_a,
+      "scales"_a,
+      "kquant_type"_a,
+      "segments"_a,
+      "transpose"_a = true,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Descriptor-driven segmented (mixture-of-experts) quantized GEMM for
+        sorted token-expert pair rows.
+
+        Args:
+            x (array): float16/bfloat16 activations [S, K], row-contiguous. The
+                sorted token-expert pair rows.
+            w (array): uint8 K-quant wire bytes shaped
+                (n_experts, N, bytes_per_row) - the transpose=True MoE layout,
+                the same gather_qmm takes. N output features; K is derived from
+                bytes_per_row via the codec.
+            scales (array): vestigial placeholder; ignored by the kernel.
+            kquant_type (str): codec name, e.g. ``"iq2_xxs"``, ``"q2_k"``.
+            segments (array): uint32 [T, 3] host-built descriptor table, rows
+                (expert_index, row_start, row_count). Row ranges are disjoint,
+                sorted, and their union covers [0, S). Every row in
+                [row_start, row_start + row_count) multiplies against
+                ``w[expert_index]``.
+            transpose (bool): must be True (only the MoE transpose shape is
+                supported).
+
+        Returns:
+            array: the segmented matmul result [S, N] (x.dtype). Weights are
+            dequantized to float32 tiles and accumulated in float32, then cast
+            to x.dtype.
+      )");
+
+  m.def(
       "quantize",
       &mlx_kquant::quantize,
       "w"_a,

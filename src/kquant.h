@@ -101,6 +101,30 @@ std::vector<mx::array> quantize(
     const std::optional<mx::array>& imatrix = std::nullopt,
     mx::StreamOrDevice s = {});
 
+// Descriptor-driven segmented (mixture-of-experts) quantized GEMM for sorted
+// token-expert pair rows. `x` is float16/bfloat16 [S, K] row-contiguous - the
+// sorted pair rows. `w` is uint8 K-quant wire bytes shaped
+// (n_experts, N, bytes_per_row), the same layout gather_qmm takes with
+// transpose=True (N output features, K derived from bytes_per_row via the
+// codec). `scales` is a vestigial placeholder (see dequantize). `segments` is a
+// uint32 [T, 3] host-built descriptor table of rows (expert_index, row_start,
+// row_count); the row ranges are disjoint, sorted, and their union covers
+// [0, S). Every row in [row_start, row_start+row_count) multiplies against
+// w[expert_index]. Weights are dequantized into threadgroup tiles of x.dtype
+// and accumulated in float32 (matching the per-pair qmm decode contract), then
+// cast to x.dtype. A float16/bfloat16 activation stages half tiles; a float32
+// activation stages float tiles and keeps full precision end to end.
+// transpose=false is rejected (only the MoE transpose shape is built). Output
+// is x.dtype [S, N]. x must be float16, bfloat16, or float32. Metal-only.
+mx::array gather_qmm_segments(
+    mx::array x,
+    mx::array w,
+    mx::array scales,
+    const std::string& kquant_type,
+    mx::array segments,
+    bool transpose = true,
+    mx::StreamOrDevice s = {});
+
 // Vector scaled-dot-product attention for large head dims (e.g. 512) that stock
 // MLX's fused vector allowlist {64,96,128,256} excludes. q/k/v are float
 // [B, n_q_heads, qL, D] / [B, n_kv_heads, kL, D] (GQA: n_q_heads % n_kv_heads
@@ -842,6 +866,43 @@ class KQuantRMSNorm2Add : public mx::Primitive {
 
  private:
   float eps_;
+};
+
+// Descriptor-driven segmented (MoE) quantized GEMM. Inference-only:
+// jvp/vjp/vmap inherit the base-class throwing defaults. eval_cpu throws
+// (Metal-only kernel). Weights decode to float32 tiles in threadgroup memory
+// and accumulate in float32, then cast to x.dtype.
+class KQuantGatherQMMSegments : public mx::Primitive {
+ public:
+  explicit KQuantGatherQMMSegments(
+      mx::Stream stream,
+      std::string kquant_type,
+      int group_size,
+      int bits)
+      : mx::Primitive(stream),
+        kquant_type_(std::move(kquant_type)),
+        group_size_(group_size),
+        bits_(bits) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantGatherQMMSegments";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  std::string kquant_type_;
+  int group_size_;
+  int bits_;
 };
 
 // Gather (MoE) quantized matmul. vjp implements only the gradient wrt x (a

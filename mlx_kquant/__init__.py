@@ -11,6 +11,7 @@ Current API:
   * ``quantized_matmul_qmv_bias`` - decode-only (M=1) bias-fused variant of
     ``quantized_matmul``, q8_0 only.
   * ``gather_qmm`` - mixture-of-experts gathered quantized matmul.
+  * ``gather_qmm_segments`` - descriptor-driven segmented MoE quantized GEMM.
   * ``quantize`` - encode a float tensor into K-quant wire bytes (CPU or Metal).
   * ``load_gguf`` - load a GGUF file's tensors + metadata (C++ mmap memcpy).
 """
@@ -27,6 +28,7 @@ from ._ext import (  # noqa: F401
     cpu_neon_available,
     dequantize,
     gather_qmm,
+    gather_qmm_segments,
     gather_qmv_bias,
     gather_qmv_kq,
     gather_qmv_mix_kq,
@@ -58,6 +60,7 @@ __all__ = [
     "cpu_neon_available",
     "dequantize",
     "gather_qmm",
+    "gather_qmm_segments",
     "gather_qmv_bias",
     "gather_qmv_kq",
     "gather_qmv_mix_kq",

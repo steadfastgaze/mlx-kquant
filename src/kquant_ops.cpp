@@ -409,6 +409,109 @@ mx::array gather_qmm(
       {x_c, w_c, scales_c, std::move(lhs_indices), std::move(rhs_indices)});
 }
 
+mx::array gather_qmm_segments(
+    mx::array x,
+    mx::array w,
+    mx::array scales,
+    const std::string& kquant_type,
+    mx::array segments,
+    bool transpose,
+    mx::StreamOrDevice s_) {
+  if (!transpose) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmm_segments] only transpose=True is supported "
+        "(the MoE weight layout [n_experts, N, bytes_per_row]).");
+  }
+  if (w.dtype() != mx::uint8) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmm_segments] w must be uint8 (raw GGUF wire "
+        "bytes).");
+  }
+  const KQuantCodec* codec = codec_by_name(kquant_type);
+  if (codec == nullptr) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmm_segments] Unknown kquant_type: '" +
+        kquant_type + "'.");
+  }
+  auto dt = x.dtype();
+  if (dt != mx::float16 && dt != mx::bfloat16 && dt != mx::float32) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmm_segments] x must be float16, bfloat16, or "
+        "float32.");
+  }
+  if (x.ndim() != 2) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmm_segments] x must be 2-D [S, K] but got shape "
+        << x.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (w.ndim() != 3) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmm_segments] w must be 3-D "
+        << "[n_experts, N, bytes_per_row] but got shape " << w.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (segments.dtype() != mx::uint32) {
+    throw std::invalid_argument(
+        "[mlx_kquant.gather_qmm_segments] segments must be uint32.");
+  }
+  if (segments.ndim() != 2 || segments.shape(-1) != 3) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmm_segments] segments must be [T, 3] but got "
+        << "shape " << segments.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  // Expand w's quantized geometry from the codec block layout. w is
+  // [n_experts, N, bytes_per_row]; the last dim is whole K-quant blocks and
+  // expands to K input features.
+  int w_bytes_per_row = w.shape(-1);
+  if (w_bytes_per_row % codec->bytes_per_block != 0) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmm_segments] KQuant weight last dim ("
+        << w_bytes_per_row << " bytes) is not a whole number of "
+        << codec->bytes_per_block << "-byte " << codec->name << " blocks.";
+    throw std::invalid_argument(msg.str());
+  }
+  int K = (w_bytes_per_row / codec->bytes_per_block) * codec->weights_per_block;
+  if (K != x.shape(-1)) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmm_segments] x last dim (" << x.shape(-1)
+        << ") does not match the expanded quantized weight inner dim (" << K
+        << ") for codec '" << codec->name << "'.";
+    throw std::invalid_argument(msg.str());
+  }
+  if (K % codec->weights_per_block != 0) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.gather_qmm_segments] K (" << K
+        << ") must be a multiple of the codec block ("
+        << codec->weights_per_block << ") for codec '" << codec->name << "'.";
+    throw std::invalid_argument(msg.str());
+  }
+
+  int N = w.shape(-2);
+
+  auto s = mx::to_stream(s_);
+
+  // Row-contiguize x / w / segments at the op level so eval_gpu can assume
+  // dense inputs (the kernel indexes x[row*K], w[(e*N+n)*row_bytes], and reads
+  // descriptors as a flat [T*3] uint32 buffer).
+  auto x_c = x.flags().row_contiguous ? x : mx::contiguous(x, false, s);
+  auto w_c = w.flags().row_contiguous ? w : mx::contiguous(w, false, s);
+  auto seg_c = segments.flags().row_contiguous
+      ? segments
+      : mx::contiguous(segments, false, s);
+
+  mx::Shape out_shape = {x.shape(0), N};
+
+  return mx::array(
+      std::move(out_shape),
+      dt,
+      std::make_shared<KQuantGatherQMMSegments>(
+          s, kquant_type, codec->weights_per_block, codec->bits),
+      {std::move(x_c), std::move(w_c), std::move(scales), std::move(seg_c)});
+}
+
 std::vector<mx::array> quantize(
     const mx::array& w,
     const std::string& kquant_type,
