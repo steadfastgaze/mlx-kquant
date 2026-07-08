@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Timing harness for gather_qmm_sorted vs gather_qmm_segments.
 
-Recreates the sorted MoE bulk-prefill shape from moespresso's speed log:
+Recreates the sorted MoE bulk-prefill shape from a downstream speed log:
 S=23058 token-expert pair rows, K=4096, N=4096, E=256, uniform segments.
 gather_qmm_sorted replaces the host-built descriptor table with an in-kernel
 binary search over the device-resident sorted ids; the value of the op is
@@ -10,8 +10,7 @@ segments kernel (within 15%), not a kernel speedup. The codec is the first
 argument (default iq2_xxs).
 
 Run:
-    uv run --project /Users/ricky/gitrepos/moespresso --locked --extra compute \
-        python scripts/bench_sorted.py [codec]
+    uv run python scripts/bench_sorted.py [codec]
 """
 
 from __future__ import annotations

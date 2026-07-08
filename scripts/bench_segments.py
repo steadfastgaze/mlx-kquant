@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """Timing harness for gather_qmm_segments vs the Python per-expert dq_f32 loop.
 
-Recreates the sorted MoE bulk-prefill shape from moespresso's speed log:
+Recreates the sorted MoE bulk-prefill shape from a downstream speed log:
 S=23058 token-expert pair rows, K=4096, N=4096, E=256, uniform segments.
 Prints both the kernel time and the dq_f32 (f32 dequantize + f32 GEMM)
 per-expert loop it is replacing. The codec is the first argument (default
 iq2_xxs).
 
 Run:
-    uv run --project /Users/ricky/gitrepos/moespresso --locked --extra compute \
-        python scripts/bench_segments.py [codec]
+    uv run python scripts/bench_segments.py [codec]
 """
 
 from __future__ import annotations
