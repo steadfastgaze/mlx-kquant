@@ -246,6 +246,44 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "sdpa_fa_prefill",
+      &mlx_kquant::sdpa_fa_prefill,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      "scale"_a,
+      "qw"_a = 0,
+      "splits"_a = 0,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Flash-style prefill attention on the GPU matrix units for a D=256 GQA
+        chunk, dense KV. Queries stay in [1, Hq, qL, D]; the kernel tiles the
+        query axis on the grid (each tile a fold of the whole GQA group with
+        ``qw`` consecutive query positions, G * qw == 32) and streams each
+        contiguous KV split once, computing S = Q @ K^T and O += P @ V on
+        simdgroup_matrix with float32 accumulators and a per-row online softmax
+        (no score tensor). Causal prefill mask: query position p attends
+        keys <= (kL - qL) + p, so the past prefix is unmasked and the self
+        chunk causal. Per-split partials merge through the same reduction pass
+        as ``sdpa_decode_gqa``.
+
+        Args:
+            q (array): queries [1, n_q_heads, qL, D], float32/float16/bfloat16;
+                D = 256.
+            k (array): keys [1, n_kv_heads, kL, D]; head/seq strided is fine
+                (read in place), the head_dim must be contiguous.
+            v (array): values [1, n_kv_heads, kL, D].
+            scale (float): query scale (typically 1/sqrt(D)).
+            qw (int): query positions folded per 32-row tile; 0 picks the
+                default 32 / (n_q_heads / n_kv_heads).
+            splits (int): key-axis split count; 0 picks the depth default.
+
+        Returns:
+            array: attention output [1, n_q_heads, qL, D].
+      )");
+
+  m.def(
       "moe_glu_gather",
       &mlx_kquant::moe_glu_gather,
       "x"_a,

@@ -452,6 +452,119 @@ void KQuantSDPAFAVerify::eval_gpu(
   }
 }
 
+void KQuantSDPAFAPrefill::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  auto& out = outputs[0];
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+
+  // q [1, Hq, qL, D] row-contiguous; k/v [1, Hkv, kL, D] read in place.
+  const auto& q = inputs[0];
+  const auto& k = inputs[1];
+  const auto& v = inputs[2];
+
+  int B = q.shape(0);
+  int n_q_heads = q.shape(1);
+  int qL = q.shape(2);
+  int D = q.shape(3);
+  int n_kv_heads = k.shape(1);
+  int kL = k.shape(2);
+  int gqa_factor = n_q_heads / n_kv_heads;
+  int qw = qw_;
+  if (qw == 0) {
+    qw = 32 / gqa_factor;
+  }
+  int n_query_tiles = (qL + qw - 1) / qw;
+  // Same coarse split buckets as sdpa_decode_gqa / fa_verify.
+  int splits = splits_;
+  if (splits == 0) {
+    splits = kL <= 8192 ? 16 : kL <= 24576 ? 32 : kL <= 49152 ? 64 : 128;
+  }
+
+  size_t k_head_stride =
+      static_cast<size_t>(k.shape(1) == 1 ? k.strides(0) : k.strides(1));
+  size_t k_seq_stride = static_cast<size_t>(k.strides(2));
+  size_t v_head_stride =
+      static_cast<size_t>(v.shape(1) == 1 ? v.strides(0) : v.strides(1));
+  size_t v_seq_stride = static_cast<size_t>(v.strides(2));
+  float scale = scale_;
+
+  // Per-split partials (float32) + running max/sum in the [B, Hq, qL, splits, D]
+  // layout the shared merge reads with grid (Hq, B, qL).
+  mx::Shape part_shape = {B, n_q_heads, qL, splits, D};
+  mx::Shape red_shape = {B, n_q_heads, qL, splits};
+  array partials(part_shape, mx::float32, nullptr, {});
+  array sums(red_shape, mx::float32, nullptr, {});
+  array maxs(red_shape, mx::float32, nullptr, {});
+  partials.set_data(mx::allocator::malloc(partials.nbytes()));
+  sums.set_data(mx::allocator::malloc(sums.nbytes()));
+  maxs.set_data(mx::allocator::malloc(maxs.nbytes()));
+
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.add_temporary(partials);
+  ce.add_temporary(sums);
+  ce.add_temporary(maxs);
+
+  std::string ts = kq_type_string(q.dtype());
+  bool has_sinks = false;
+  mx::metal::MTLFCList fc = {
+      {&splits, MTL::DataType::DataTypeInt, 2},
+      {&has_sinks, MTL::DataType::DataTypeBool, 3},
+  };
+
+  // Pass 1: one 128-thread threadgroup per (kv-head, query-tile, split) streams
+  // its key chunk through the simdgroup-matrix tile.
+  {
+    std::string kname = "kq_sdpa_fa_prefill_2pass_1_" + ts + "_" +
+        std::to_string(D) + "_q" + std::to_string(qw);
+    std::string hash = kname + "_s" + std::to_string(splits);
+    auto kernel = kq_get_kernel(d, kname, hash, fc);
+    const size_t tg = 128;
+    if (tg > kernel->maxTotalThreadsPerThreadgroup()) {
+      throw std::runtime_error(
+          "[mlx_kquant.sdpa_fa_prefill] threadgroup of " + std::to_string(tg) +
+          " threads exceeds this GPU's pipeline limit (" +
+          std::to_string(kernel->maxTotalThreadsPerThreadgroup()) + ").");
+    }
+    ce.set_compute_pipeline_state(kernel);
+    ce.set_input_array(q, 0);
+    ce.set_input_array(k, 1);
+    ce.set_input_array(v, 2);
+    ce.set_output_array(partials, 3);
+    ce.set_output_array(sums, 4);
+    ce.set_output_array(maxs, 5);
+    ce.set_bytes(kL, 6);
+    ce.set_bytes(k_head_stride, 7);
+    ce.set_bytes(k_seq_stride, 8);
+    ce.set_bytes(v_head_stride, 9);
+    ce.set_bytes(v_seq_stride, 10);
+    ce.set_bytes(scale, 11);
+    ce.set_bytes(qL, 12);
+    MTL::Size group_dims(32, 4, 1);
+    MTL::Size grid_dims(n_kv_heads, n_query_tiles, splits);
+    ce.dispatch_threadgroups(grid_dims, group_dims);
+  }
+
+  // Pass 2: the shared kq_sdpa_gqa merge; grid z is the query axis.
+  {
+    std::string kname = "kq_sdpa_gqa_2pass_2_" + ts + "_" + std::to_string(D);
+    std::string hash = kname + "_s" + std::to_string(splits) + "_k0";
+    auto kernel = kq_get_kernel(d, kname, hash, fc);
+    ce.set_compute_pipeline_state(kernel);
+    ce.set_input_array(partials, 0);
+    ce.set_input_array(sums, 1);
+    ce.set_input_array(maxs, 2);
+    ce.set_input_array(sums, 3);
+    ce.set_output_array(out, 4);
+    ce.set_bytes(n_q_heads, 5);
+    MTL::Size group_dims(32, 1, 1);
+    MTL::Size grid_dims(n_q_heads, B, qL);
+    ce.dispatch_threadgroups(grid_dims, group_dims);
+  }
+}
+
 #else // !_METAL_
 
 void KQuantSDPA::eval_gpu(
@@ -472,6 +585,13 @@ void KQuantSDPAFAVerify::eval_gpu(
     std::vector<mx::array>&) {
   throw std::runtime_error(
       "[mlx_kquant.sdpa_fa_verify] requires a Metal build.");
+}
+
+void KQuantSDPAFAPrefill::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.sdpa_fa_prefill] requires a Metal build.");
 }
 
 #endif
@@ -809,6 +929,101 @@ mx::array sdpa_fa_verify(
       std::move(out_shape),
       dt,
       std::make_shared<KQuantSDPAFAVerify>(s, scale, q_len, splits),
+      {std::move(q_c), std::move(k_c), std::move(v_c)});
+}
+
+void KQuantSDPAFAPrefill::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant.sdpa_fa_prefill] has no CPU implementation.");
+}
+
+std::vector<mx::Shape> KQuantSDPAFAPrefill::output_shapes(
+    const std::vector<mx::array>& inputs) {
+  return {inputs[0].shape()};
+}
+
+bool KQuantSDPAFAPrefill::is_equivalent(const mx::Primitive& other) const {
+  const auto& o = static_cast<const KQuantSDPAFAPrefill&>(other);
+  return scale_ == o.scale_ && qw_ == o.qw_ && splits_ == o.splits_;
+}
+
+mx::array sdpa_fa_prefill(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    float scale,
+    int qw,
+    int splits,
+    mx::StreamOrDevice s_) {
+  auto s = mx::to_stream(s_);
+
+  if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_fa_prefill] q, k, v must be 4-D [B, heads, L, D].");
+  }
+  int D = q.shape(-1);
+  if (D != 256 || k.shape(-1) != D || v.shape(-1) != D) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_fa_prefill] only head_dim 256 is supported.");
+  }
+  auto dt = q.dtype();
+  if (dt != mx::float32 && dt != mx::float16 && dt != mx::bfloat16) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_fa_prefill] q must be float32, float16, or "
+        "bfloat16.");
+  }
+  if (k.dtype() != dt || v.dtype() != dt) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_fa_prefill] q, k, v must share a dtype.");
+  }
+  if (q.shape(0) != 1 || k.shape(0) != 1 || v.shape(0) != 1) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_fa_prefill] batch size must be 1.");
+  }
+  int n_q_heads = q.shape(1);
+  int n_kv_heads = k.shape(1);
+  if (n_kv_heads == 0 || n_q_heads % n_kv_heads != 0) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_fa_prefill] n_q_heads must be a multiple of "
+        "n_kv_heads.");
+  }
+  if (v.shape(1) != n_kv_heads || v.shape(2) != k.shape(2)) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_fa_prefill] k and v must share heads and key "
+        "length.");
+  }
+  int gqa_factor = n_q_heads / n_kv_heads;
+  if (qw == 0) {
+    qw = 32 / gqa_factor;
+  }
+  // One 32-row tile folds the whole GQA group with qw query positions.
+  if (qw < 1 || gqa_factor * qw != 32) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_fa_prefill] gqa_factor * qw must equal 32 (qw 0 "
+        "picks the default).");
+  }
+  int qL = q.shape(2);
+  int kL = k.shape(2);
+  if (kL < qL) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_fa_prefill] key length must be >= query length.");
+  }
+  if (splits < 0 || splits > 128) {
+    throw std::invalid_argument(
+        "[mlx_kquant.sdpa_fa_prefill] splits must be in [0, 128].");
+  }
+
+  auto q_c = q.flags().row_contiguous ? q : mx::contiguous(q, false, s);
+  auto k_c = k.strides().back() == 1 ? k : mx::contiguous(k, false, s);
+  auto v_c = v.strides().back() == 1 ? v : mx::contiguous(v, false, s);
+
+  auto out_shape = q_c.shape();
+  return mx::array(
+      std::move(out_shape),
+      dt,
+      std::make_shared<KQuantSDPAFAPrefill>(s, scale, qw, splits),
       {std::move(q_c), std::move(k_c), std::move(v_c)});
 }
 

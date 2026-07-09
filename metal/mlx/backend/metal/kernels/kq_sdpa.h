@@ -694,6 +694,240 @@ template <typename T, int D>
   }
 }
 
+// Simdgroup-matrix (steel MMA) prefill attention, pass 1, dense KV. Extends the
+// fa_verify tile to a full prefill chunk by tiling the query axis on the grid:
+// the verify kernel packs one BQ=32 fold of G*qL <= 32 rows, this kernel walks
+// ceil(qL / QW) query tiles, each a fold of the whole GQA group (G heads) with
+// QW consecutive query positions (G * QW == BQ == 32). Row r of a tile maps to
+// query head kv_head*G + r/QW and query position qtile*QW + r%QW; queries stay
+// in their natural [B, Hq, qL, D] layout and each row loads its own device
+// slice, so no host fold is needed. Grid (n_kv_heads, n_query_tiles,
+// gqa_splits): each threadgroup streams its contiguous key chunk once through
+// threadgroup-staged K/V tiles, computing S = Q @ K^T and O += P @ V on
+// simdgroup_matrix with float32 accumulators, one query tile against one KV
+// head and key split.
+//
+// Causal mask, prefill form. The chunk's qL queries occupy the trailing rows of
+// the depth-N cache: query position p (0-based within the chunk) attends keys
+// <= (N - qL) + p, so past-prefix keys are always in range and the self-chunk
+// keys are causal. This is the single band the composed prefill path applies.
+// Only tiles reaching past N - qL or the split tail take the mask branch.
+// exp2-space online softmax as in fa_verify; partials merge through
+// kq_sdpa_gqa_2pass_2 with grid (Hq, B, qL) and n_q_heads = Hq, so the output
+// is the natural [B, Hq, qL, D].
+//
+// Dense KV only: both the past prefix and the self chunk are read from one
+// contiguous key array. The q8 past-phase variant streams the past prefix from
+// the quantized cache instead (kq_sdpa_fa_prefill_q8_2pass_1).
+//
+// BK is the keys staged per tile. A float32 K/V path stages 4 bytes per element,
+// so BK=32 at D=256 overflows the 32 KB threadgroup limit (LDK*D*4 = 36 KB);
+// the float instantiation uses BK=16 (LDK*D*4 = 20 KB). Half-precision paths
+// keep BK=32.
+template <typename T, int D, int QW, int BK = 32>
+[[kernel]] void kq_sdpa_fa_prefill_2pass_1(
+    const device T* queries [[buffer(0)]],
+    const device T* keys [[buffer(1)]],
+    const device T* values [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    device float* sums [[buffer(4)]],
+    device float* maxs [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const constant size_t& k_head_stride [[buffer(7)]],
+    const constant size_t& k_seq_stride [[buffer(8)]],
+    const constant size_t& v_head_stride [[buffer(9)]],
+    const constant size_t& v_seq_stride [[buffer(10)]],
+    const constant float& scale [[buffer(11)]],
+    const constant int& q_len [[buffer(12)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]]) {
+  constexpr int BQ = 32; // query rows per tile (G * QW)
+  constexpr int GQ = BQ / QW; // GQA heads folded into one tile
+  constexpr int kNWarps = BQ / 8;
+  constexpr short kFragSize = 8;
+  constexpr short TK = BK / kFragSize;
+  constexpr short TD = D / kFragSize;
+  constexpr short kPad = 16 / sizeof(T);
+  constexpr short LDK = BK + kPad; // Ks staged transposed [D][BK + pad]
+  constexpr short LDV = D + kPad; // Vs staged row-major [BK][D + pad]
+  constexpr int kSmemKV = (LDK * D > BK * LDV) ? LDK * D : BK * LDV;
+
+  using MMAFrag_t = mlx::steel::BaseMMAFrag<float, kFragSize, kFragSize>;
+  using KLoader = mlx::steel::BlockLoaderT<T, BK, D, 1, LDK, 0, kNWarps * 32>;
+  using VLoader = mlx::steel::BlockLoaderT<T, BK, D, LDV, 1, 0, kNWarps * 32>;
+
+  threadgroup T KV_smem[kSmemKV];
+
+  const int kv_head_idx = tid.x;
+  const int qtile_idx = tid.y;
+  const int split_idx = tid.z;
+  const int num_kv_heads = tpg.x;
+  const int num_q_heads = num_kv_heads * GQ;
+  const int q0 = qtile_idx * QW; // first query position of this tile
+
+  // Contiguous, BK-aligned chunk of the key axis for this threadgroup.
+  const int chunk = ((N + gqa_splits * BK - 1) / (gqa_splits * BK)) * BK;
+  const int k0 = split_idx * chunk;
+  const int k1 = min(k0 + chunk, N);
+
+  const device T* kbase = keys +
+      (size_t)kv_head_idx * k_head_stride + (size_t)k0 * k_seq_stride;
+  const device T* vbase = values +
+      (size_t)kv_head_idx * v_head_stride + (size_t)k0 * v_seq_stride;
+
+  KLoader loader_k(
+      kbase, static_cast<int>(k_seq_stride), KV_smem, simd_gid, simd_lid);
+  VLoader loader_v(
+      vbase, static_cast<int>(v_seq_stride), KV_smem, simd_gid, simd_lid);
+
+  const short2 sc = MMAFrag_t::get_coord(simd_lid);
+  const short sm = sc.y;
+  const short sn = sc.x;
+  const int row = int(simd_gid) * kFragSize + sm;
+  // Row -> (query head within kv group, query position in the chunk).
+  const int gq_head = row / QW; // 0 .. GQ-1
+  const int q_pos = q0 + (row % QW); // absolute query position in the chunk
+  const int q_head_idx = kv_head_idx * GQ + gq_head;
+  const bool row_active = q_pos < q_len;
+  // Highest key this query attends: prefix + causal self-chunk.
+  const int lim = (N - q_len) + q_pos;
+  const int lim_min = N - q_len; // every real query attends at least this far
+
+  // Q tile in float32 fragments; each row reads its own [q_head, q_pos] slice.
+  // A row past the chunk (q_pos >= q_len) zero-fills and is never written.
+  mlx::steel::MMATile<float, 1, TD, MMAFrag_t> Qtile;
+  {
+    const device T* qrow = row_active
+        ? queries + ((size_t)q_head_idx * q_len + q_pos) * D + sn
+        : queries + sn;
+    Qtile.template load_safe<T, 1, 1>(
+        qrow, D, short2(D - sn, row_active ? 1 : 0));
+  }
+
+  mlx::steel::MMATile<float, 1, TK, MMAFrag_t> Stile;
+  mlx::steel::MMATile<float, 1, TK, MMAFrag_t> Ktile;
+  mlx::steel::MMATile<float, 1, 1, MMAFrag_t> Vtile;
+  mlx::steel::MMATile<float, 1, TD, MMAFrag_t> Otile;
+  Otile.clear();
+
+  const float scale2 = scale * M_LOG2E_F;
+  float max_score = Limits<float>::finite_min;
+  float sum_score = 0;
+
+  for (int kt = k0; kt < k1; kt += BK) {
+    const int krem = k1 - kt;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (krem < BK) {
+      loader_k.load_safe(short2(D, krem));
+    } else {
+      loader_k.load_unsafe();
+    }
+    Stile.clear();
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // S = Q @ K^T, one 8-deep head-dim slab at a time.
+    STEEL_PRAGMA_UNROLL
+    for (short dd = 0; dd < TD; dd++) {
+      simdgroup_barrier(mem_flags::mem_none);
+      Ktile.template load<T, 1, 1, LDK, 1>(
+          &KV_smem[(dd * kFragSize + sm) * LDK + sn]);
+      simdgroup_barrier(mem_flags::mem_none);
+      STEEL_PRAGMA_UNROLL
+      for (short ik = 0; ik < TK; ik++) {
+        MMAFrag_t::mma(
+            Stile.frag_at(0, ik),
+            Qtile.frag_at(0, dd),
+            Ktile.frag_at(0, ik),
+            Stile.frag_at(0, ik));
+      }
+    }
+
+    STEEL_PRAGMA_UNROLL
+    for (short ii = 0; ii < decltype(Stile)::kElemsPerTile; ii++) {
+      Stile.elems()[ii] *= scale2;
+    }
+    if (krem < BK || kt + BK - 1 > lim_min) {
+      STEEL_PRAGMA_UNROLL
+      for (short ik = 0; ik < TK; ik++) {
+        const int kg = kt + ik * kFragSize + sn;
+        STEEL_PRAGMA_UNROLL
+        for (short jj = 0; jj < MMAFrag_t::kElemCols; jj++) {
+          if (kg + jj >= k1 || kg + jj > lim) {
+            Stile.frag_at(0, ik)[jj] = Limits<float>::finite_min;
+          }
+        }
+      }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (krem < BK) {
+      loader_v.load_safe(short2(D, krem));
+    } else {
+      loader_v.load_unsafe();
+    }
+
+    float new_max = max_score;
+    Stile.template row_reduce<KQMaxOp>(&new_max);
+    if (new_max > Limits<float>::finite_min) {
+      Stile.template row_bin_op<KQExpSubOp>(&new_max);
+      float factor = fast::exp2(max_score - new_max);
+      float tile_sum = 0;
+      Stile.template row_reduce<KQSumOp>(&tile_sum);
+      sum_score = sum_score * factor + tile_sum;
+      max_score = new_max;
+      Otile.template row_bin_op<KQMulOp>(&factor);
+    } else {
+      STEEL_PRAGMA_UNROLL
+      for (short ii = 0; ii < decltype(Stile)::kElemsPerTile; ii++) {
+        Stile.elems()[ii] = 0;
+      }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // O += P @ V
+    STEEL_PRAGMA_UNROLL
+    for (short id = 0; id < TD; id++) {
+      STEEL_PRAGMA_UNROLL
+      for (short ik = 0; ik < TK; ik++) {
+        Vtile.template load<T, 1, 1, LDV, 1>(
+            &KV_smem[(ik * kFragSize + sm) * LDV + id * kFragSize + sn]);
+        MMAFrag_t::mma(
+            Otile.frag_at(0, id),
+            Stile.frag_at(0, ik),
+            Vtile.frag_at(0, 0),
+            Otile.frag_at(0, id));
+      }
+    }
+
+    loader_k.next();
+    loader_v.next();
+  }
+
+  // Partials in the [B, Hq, qL, gqa_splits, D] layout the merge pass reads with
+  // grid (Hq, B, qL); one B here.
+  if (row_active) {
+    const size_t po =
+        ((size_t)q_head_idx * q_len + q_pos) * gqa_splits + split_idx;
+    device float* orow = out + po * D + sn;
+    STEEL_PRAGMA_UNROLL
+    for (short id = 0; id < TD; id++) {
+      STEEL_PRAGMA_UNROLL
+      for (short jj = 0; jj < MMAFrag_t::kElemCols; jj++) {
+        orow[id * kFragSize + jj] = Otile.frag_at(0, id)[jj];
+      }
+    }
+    if (sn == 0) {
+      sums[po] = sum_score;
+      maxs[po] = max_score == Limits<float>::finite_min
+          ? Limits<float>::finite_min
+          : max_score * M_LN2_F;
+    }
+  }
+}
+
 // Merge the per-split partials; one simdgroup per (q-head, batch, query).
 // Grid z is the query axis (1 at decode; q_len at verify width). Sinks are
 // a per-q-head extra logit with no value row: they raise the global max and

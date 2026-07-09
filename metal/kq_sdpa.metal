@@ -102,12 +102,39 @@ instantiate_kq_sdpa_gqa_p2(float16_t, 64, 32, 4)
 instantiate_kq_sdpa_fa_verify(bfloat16_t, 256)
 instantiate_kq_sdpa_fa_verify(float16_t, 256)
 
+// Simdgroup-matrix FA prefill pass 1 (dense KV): the fa_verify tile plus an
+// outer query-tile loop on the grid. QW is the query positions folded per tile
+// (G * QW == 32); the merge reuses kq_sdpa_gqa_2pass_2 with grid (Hq, B, qL).
+// float variant carries the served float32 query/key path; the half variants
+// support the unit fences and mixed-dtype experiments.
+#define instantiate_kq_sdpa_fa_prefill(type, D, QW, BK)                 \
+  instantiate_kernel(                                                   \
+      "kq_sdpa_fa_prefill_2pass_1_" #type "_" #D "_q" #QW,             \
+      kq_sdpa_fa_prefill_2pass_1,                                       \
+      type,                                                             \
+      D,                                                                \
+      QW,                                                               \
+      BK)
+
+// float32 K/V staging is 4 bytes/element, so BK=16 keeps the threadgroup tile
+// under the 32 KB limit at D=256; the half-precision paths stage BK=32.
+instantiate_kq_sdpa_fa_prefill(float, 256, 2, 16)
+instantiate_kq_sdpa_fa_prefill(float, 256, 4, 16)
+instantiate_kq_sdpa_fa_prefill(float, 256, 8, 16)
+instantiate_kq_sdpa_fa_prefill(bfloat16_t, 256, 2, 32)
+instantiate_kq_sdpa_fa_prefill(bfloat16_t, 256, 4, 32)
+instantiate_kq_sdpa_fa_prefill(bfloat16_t, 256, 8, 32)
+instantiate_kq_sdpa_fa_prefill(float16_t, 256, 2, 32)
+instantiate_kq_sdpa_fa_prefill(float16_t, 256, 4, 32)
+instantiate_kq_sdpa_fa_prefill(float16_t, 256, 8, 32)
+
 instantiate_kq_sdpa_gqa_merge(bfloat16_t, 64)
 instantiate_kq_sdpa_gqa_merge(float16_t, 64)
 instantiate_kq_sdpa_gqa_merge(bfloat16_t, 128)
 instantiate_kq_sdpa_gqa_merge(float16_t, 128)
 instantiate_kq_sdpa_gqa_merge(bfloat16_t, 256)
 instantiate_kq_sdpa_gqa_merge(float16_t, 256)
+instantiate_kq_sdpa_gqa_merge(float, 256)
 instantiate_kq_sdpa_gqa_merge(bfloat16_t, 512)
 instantiate_kq_sdpa_gqa_merge(float16_t, 512)
     // clang-format on

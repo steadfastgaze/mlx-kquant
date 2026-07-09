@@ -7,6 +7,18 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Flash prefill attention** (`kq.sdpa_fa_prefill`): simdgroup-matrix
+  head-dim-256 GQA prefill attention over a full query chunk with an online
+  softmax and float32 accumulators, so the quadratic score tensor never
+  materializes. Extends the `sdpa_fa_verify` tile with an outer query-tile grid
+  loop; queries stay in `[1, Hq, qL, D]`, each 32-row tile folds the GQA group
+  with `qw` query positions, and the causal band matches the composed prefill
+  path (query p attends keys <= (kL - qL) + p). Float32 (the served query
+  dtype), bfloat16, and float16; the float32 path stages 16 keys per tile to
+  fit the threadgroup limit. Peak attention memory falls ~2x at long context;
+  the float32 staging width measured about 3 percent behind the composed path
+  on served long-context prefill (779 against 805 t/s at 37K), the time cost
+  of its 16-key tile.
 - `sdpa_vector` attention sinks and boolean masks, with a wide-MQA dispatch
   shape for single-KV-head decode (one query head block per simdgroup).
 - **Segmented MoE quantized GEMM** (`kq.gather_qmm_segments`): bulk routed

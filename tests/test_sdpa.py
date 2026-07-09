@@ -332,6 +332,120 @@ def test_sdpa_fa_verify_causal_split_straddle():
     _check_fa(256, 4, kL=4098, dtype=mx.bfloat16, splits=128, G=6)
 
 
+# --- FA prefill (dense KV) ---------------------------------------------------
+
+# The prefill kernel keeps queries in [1, Hq, qL, D] and tiles the query axis on
+# the grid, so it needs a full-chunk reference. Float32 is the served query
+# dtype and gets the tightest bound (fp32-grade); the half arms carry the wider
+# rounding bound.
+PREFILL_REL_BOUND = {mx.float32: 5e-6, mx.bfloat16: 5e-3, mx.float16: 2e-3}
+
+
+def _ref_prefill(q, k, v, scale):
+    """f32 materialized prefill attention: query position p (of qL) attends
+    keys <= (kL - qL) + p, so the past prefix is unmasked and the self chunk
+    causal -- the single band the composed prefill path applies."""
+    g = q.shape[1] // k.shape[1]
+    kr = mx.repeat(k, g, axis=1).astype(mx.float32)
+    vr = mx.repeat(v, g, axis=1).astype(mx.float32)
+    qL, kL = q.shape[2], k.shape[2]
+    s = (q.astype(mx.float32) @ kr.swapaxes(-1, -2)) * scale
+    rows = ((kL - qL) + mx.arange(qL)).reshape(qL, 1)
+    cols = mx.arange(kL).reshape(1, kL)
+    s = mx.where(cols <= rows, s, float("-inf"))
+    w = mx.softmax(s, axis=-1)
+    return (w @ vr).astype(q.dtype)
+
+
+def _check_prefill(D, qL, kL, dtype, Hq=16, Hkv=2, qw=0, strided=False, splits=0):
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make(
+        1, Hq, Hkv, qL, kL, D, dtype, seed=qL * 11 + kL + D, strided=strided
+    )
+    got = kq.sdpa_fa_prefill(q, k, v, scale, qw=qw, splits=splits)
+    ref = _ref_prefill(q, k, v, scale)
+    _eval_or_skip(got, ref)
+    rel = _rel(got, ref)
+    bound = PREFILL_REL_BOUND[dtype]
+    tag = "strided" if strided else "contig"
+    print(
+        f"  [prefill] D={D} qL={qL} kL={kL} Hq={Hq} Hkv={Hkv} qw={qw} "
+        f"{str(dtype)[9:]:>9} {tag}: rel={rel:.3e}"
+    )
+    assert rel < bound, f"D={D} qL={qL} kL={kL} rel {rel:.3e} >= {bound:.0e}"
+    assert got.shape == q.shape
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("kL", [2048, 4096, 8192])
+def test_sdpa_fa_prefill_serving_geometry(dtype, kL):
+    # The 16:2 GQA, head-dim-256 serving geometry: 16 q heads, 2 kv heads,
+    # chunk 2048.
+    _check_prefill(256, qL=2048, kL=kL, dtype=dtype)
+
+
+def test_sdpa_fa_prefill_chunk0():
+    # Chunk 0 form: the whole chunk attends only itself (qL == kL).
+    _check_prefill(256, qL=2048, kL=2048, dtype=mx.float32)
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_sdpa_fa_prefill_unaligned(dtype):
+    # qL and kL off every tile/split boundary (partial query tile, partial key
+    # tile, partial split tail).
+    _check_prefill(256, qL=100, kL=133, dtype=dtype, splits=16)
+    _check_prefill(256, qL=37, kL=37, dtype=dtype, splits=16)
+
+
+def test_sdpa_fa_prefill_decode_shape():
+    # qL == 1 decode shape: one query attends the whole prefix (no causal cut).
+    _check_prefill(256, qL=1, kL=8192, dtype=mx.float32)
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16])
+def test_sdpa_fa_prefill_strided(dtype):
+    # strided KV-cache prefix (head stride > kL*D) read in place without a copy.
+    _check_prefill(256, qL=512, kL=3071, dtype=dtype, strided=True, splits=16)
+
+
+def test_sdpa_fa_prefill_qw_fold():
+    # Explicit qw at the 16:2 GQA serving fold (G=8 -> qw 4 fills a 32-row
+    # tile).
+    _check_prefill(256, qL=1000, kL=3000, dtype=mx.float32, qw=4)
+
+
+def test_sdpa_fa_prefill_gqa_factors():
+    # A 4:1 fold (G=4 -> qw default 8) and a 16:1 fold (G=16 -> qw default 2).
+    _check_prefill(256, qL=300, kL=1000, dtype=mx.float32, Hq=8, Hkv=2)
+    _check_prefill(256, qL=200, kL=900, dtype=mx.float32, Hq=16, Hkv=1)
+
+
+def test_sdpa_fa_prefill_short_kv():
+    # kL small enough that most splits stage zero keys: empty-split partials
+    # (max = finite_min, sum = 0) must merge as weight zero.
+    _check_prefill(256, qL=8, kL=17, dtype=mx.float32, splits=16)
+
+
+def test_sdpa_fa_prefill_rejects_bad_geometry():
+    scale = 1.0 / 16.0
+    q = mx.zeros((1, 16, 8, 256))
+    k = mx.zeros((1, 2, 32, 256))
+    v = mx.zeros((1, 2, 32, 256))
+    # head_dim off contract.
+    with pytest.raises(ValueError):
+        kq.sdpa_fa_prefill(mx.zeros((1, 16, 8, 128)), mx.zeros((1, 2, 32, 128)),
+                           mx.zeros((1, 2, 32, 128)), scale)
+    # batch > 1.
+    with pytest.raises(ValueError):
+        kq.sdpa_fa_prefill(mx.zeros((2, 16, 8, 256)), mx.zeros((2, 2, 32, 256)),
+                           mx.zeros((2, 2, 32, 256)), scale)
+    # qw that does not fill a 32-row tile for the GQA factor (G=8 needs qw 4).
+    with pytest.raises(ValueError):
+        kq.sdpa_fa_prefill(q, k, v, scale, qw=3)
+    # key length shorter than the query chunk.
+    with pytest.raises(ValueError):
+        kq.sdpa_fa_prefill(mx.zeros((1, 16, 64, 256)), mx.zeros((1, 2, 8, 256)),
+                           mx.zeros((1, 2, 8, 256)), scale)
 
 
 @pytest.mark.parametrize("D", [256, 512])

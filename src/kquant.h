@@ -273,6 +273,26 @@ mx::array sdpa_fa_verify(
     int splits = 0,
     mx::StreamOrDevice s = {});
 
+// Flash-style prefill attention on the GPU matrix units for a D=256 GQA chunk,
+// dense KV. Queries stay in [1, Hq, qL, D]; the kernel tiles the query axis on
+// the grid (each tile a fold of the whole GQA group with qw consecutive query
+// positions, G * qw == 32) and streams each contiguous KV split once (S = Q @
+// K^T and O += P @ V on simdgroup_matrix, float32 accumulators, online softmax
+// per row, no score tensor). Causal prefill mask: query p attends keys <= (kL -
+// qL) + p, so the past prefix is unmasked and the self chunk causal. k/v are
+// [1, Hkv, kL, D], read in place via head/seq strides (head_dim contiguous).
+// Requires B == 1, head_dim 256, Hq % Hkv == 0, (Hq / Hkv) * qw == 32, kL >=
+// qL. `qw` 0 picks the default for the GQA factor; `splits` 0 picks the depth
+// default. Metal-only.
+mx::array sdpa_fa_prefill(
+    mx::array q,
+    mx::array k,
+    mx::array v,
+    float scale,
+    int qw = 0,
+    int splits = 0,
+    mx::StreamOrDevice s = {});
+
 // Fused MoE GLU gather on the MLX packed mxfp4 layout: gate and up expert
 // matvecs (sharing each activation load), expert biases, and the clamped
 // SwiGLU epilogue out = (min(g, limit) * sigmoid(alpha * g)) * (clip(u,
@@ -644,6 +664,34 @@ class KQuantSDPAFAVerify : public mx::Primitive {
  private:
   float scale_;
   int q_len_;
+  int splits_;
+};
+
+// Simdgroup-matrix FA prefill attention, dense KV (see sdpa_fa_prefill).
+// Inference-only.
+class KQuantSDPAFAPrefill : public mx::Primitive {
+ public:
+  explicit KQuantSDPAFAPrefill(mx::Stream stream, float scale, int qw, int splits)
+      : mx::Primitive(stream), scale_(scale), qw_(qw), splits_(splits) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantSDPAFAPrefill";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float scale_;
+  int qw_;
   int splits_;
 };
 
