@@ -128,6 +128,82 @@ instantiate_kq_sdpa_fa_prefill(float16_t, 256, 2, 32)
 instantiate_kq_sdpa_fa_prefill(float16_t, 256, 4, 32)
 instantiate_kq_sdpa_fa_prefill(float16_t, 256, 8, 32)
 
+// FA prefill pass 1, q8 past phase (the serving form): float32 queries and
+// accumulators, past prefix dequantized from the QuantizedKVCache tuple into
+// StageT threadgroup staging during load, dense self chunk cast alongside.
+// The name carries the staging type; queries are always float32. The float
+// staging instantiation (BK=16) is the full-precision verification arm and the
+// memory-lever fallback form.
+#define instantiate_kq_sdpa_fa_prefill_q8(stype, D, QW, BK, BQ)         \
+  instantiate_kernel(                                                   \
+      "kq_sdpa_fa_prefill_q8_2pass_1_" #stype "_" #D "_q" #QW "_b" #BQ  \
+      "_k" #BK,                                                         \
+      kq_sdpa_fa_prefill_q8_2pass_1,                                    \
+      stype,                                                            \
+      D,                                                                \
+      QW,                                                               \
+      BK,                                                               \
+      BQ)
+
+// BQ=64 (256-thread threadgroup) folds twice the query positions onto each
+// staged KV tile and is the serving width for the 16:2 GQA, head-dim-256
+// serving geometry (G=8, QW=8); the BQ=32 forms cover the other GQA folds and
+// the verification arm.
+// BK=48 stages half again more keys per tile within the 32 KB threadgroup
+// budget (half staging only), cutting the per-tile barrier count at depth.
+instantiate_kq_sdpa_fa_prefill_q8(bfloat16_t, 256, 2, 32, 32)
+instantiate_kq_sdpa_fa_prefill_q8(bfloat16_t, 256, 4, 32, 32)
+instantiate_kq_sdpa_fa_prefill_q8(bfloat16_t, 256, 8, 32, 32)
+instantiate_kq_sdpa_fa_prefill_q8(bfloat16_t, 256, 8, 32, 64)
+instantiate_kq_sdpa_fa_prefill_q8(bfloat16_t, 256, 8, 48, 64)
+instantiate_kq_sdpa_fa_prefill_q8(float16_t, 256, 2, 32, 32)
+instantiate_kq_sdpa_fa_prefill_q8(float16_t, 256, 4, 32, 32)
+instantiate_kq_sdpa_fa_prefill_q8(float16_t, 256, 8, 32, 32)
+instantiate_kq_sdpa_fa_prefill_q8(float16_t, 256, 8, 32, 64)
+instantiate_kq_sdpa_fa_prefill_q8(float16_t, 256, 8, 48, 64)
+// The float32 staging form pins BK=16: BK=32 at float32 needs 36 KB of
+// threadgroup memory, over the 32 KB budget. So BQ is the only fold, and both
+// widths stage the same 16-key tiles. BQ=64 folds twice the query positions
+// onto each tile, halving the per-row staging and dequant work.
+instantiate_kq_sdpa_fa_prefill_q8(float, 256, 4, 16, 32)
+instantiate_kq_sdpa_fa_prefill_q8(float, 256, 8, 16, 64)
+
+// Fused q8 decode pass 1 (the serving form of the KV-attention read): float32
+// queries and accumulators, the whole q8 cache dequantized from the tuple into
+// StageT threadgroup staging during load, one query row folded as BQ heads. The
+// name carries the staging type; the float staging is the served full-precision
+// form and the dequant-exactness verification arm. BQ is the GQA fold (8 for
+// the 16:2 GQA, head-dim-256 serving geometry); the merge reuses
+// kq_sdpa_gqa_2pass_2 on the float output.
+#define instantiate_kq_sdpa_decode_q8(stype, D, BQ)                     \
+  instantiate_kernel(                                                   \
+      "kq_sdpa_decode_q8_2pass_1_" #stype "_" #D "_b" #BQ,             \
+      kq_sdpa_decode_q8_2pass_1,                                        \
+      stype,                                                            \
+      D,                                                                \
+      BQ)
+
+instantiate_kq_sdpa_decode_q8(float, 256, 8)
+instantiate_kq_sdpa_decode_q8(bfloat16_t, 256, 8)
+instantiate_kq_sdpa_decode_q8(float16_t, 256, 8)
+
+// SIMD-shuffle q8 decode pass 1 (the decode-latency form): float32 queries and
+// staging, the whole q8 cache dequantized during the cooperative tile load, the
+// GQA group folded per threadgroup. C is the staged tile height (float4 staging
+// is 16 bytes per element, so C=8 stages 16 KB and C=16 stages 32 KB at D=256);
+// NE is the keys in flight per simdgroup. The merge reuses kq_sdpa_gqa_2pass_2
+// on the float output.
+#define instantiate_kq_sdpa_decode_gqa_q8(D, C, NE)                     \
+  instantiate_kernel(                                                   \
+      "kq_sdpa_decode_gqa_q8_2pass_1_" #D "_c" #C "_ne" #NE,           \
+      kq_sdpa_decode_gqa_q8_2pass_1,                                    \
+      D,                                                                \
+      C,                                                                \
+      NE)
+
+instantiate_kq_sdpa_decode_gqa_q8(256, 8, 4)
+instantiate_kq_sdpa_decode_gqa_q8(256, 16, 4)
+
 instantiate_kq_sdpa_gqa_merge(bfloat16_t, 64)
 instantiate_kq_sdpa_gqa_merge(float16_t, 64)
 instantiate_kq_sdpa_gqa_merge(bfloat16_t, 128)

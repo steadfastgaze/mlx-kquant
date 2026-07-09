@@ -284,6 +284,115 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "sdpa_fa_prefill_q8",
+      &mlx_kquant::sdpa_fa_prefill_q8,
+      "q"_a,
+      "pk_w"_a,
+      "pk_s"_a,
+      "pk_b"_a,
+      "pv_w"_a,
+      "pv_s"_a,
+      "pv_b"_a,
+      "self_k"_a,
+      "self_v"_a,
+      "scale"_a,
+      "group_size"_a = 64,
+      "bits"_a = 8,
+      "qw"_a = 0,
+      "bq"_a = 0,
+      "bk"_a = 0,
+      "splits"_a = 0,
+      "stage"_a = 0,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        The serving form of ``sdpa_fa_prefill``: float32 queries and
+        accumulators, the past prefix read directly from a QuantizedKVCache
+        tuple (packed uint32, float32 scales and biases, group 64, 8 bits) and
+        the fresh self-chunk keys and values read dense. Past tiles dequantize
+        with fma(scale, q, bias), the exact mx dequantization form, into the
+        staging tiles during the cooperative load; self tiles cast from
+        float32. Query position p attends keys <= past_len + p on the combined
+        key axis, so the past prefix is unmasked and the self chunk causal.
+        No score tensor reaches device memory.
+
+        Args:
+            q (array): queries [1, n_q_heads, qL, 256], float32.
+            pk_w, pk_s, pk_b (arrays): past K quantized tuple
+                [1, n_kv_heads, past_len, 64|4|4] (uint32, float32, float32).
+            pv_w, pv_s, pv_b (arrays): past V quantized tuple, same geometry.
+            self_k (array): fresh dense keys [1, n_kv_heads, qL, 256]; cast to
+                float32 if needed.
+            self_v (array): fresh dense values, same shape and treatment.
+            scale (float): query scale (typically 1/sqrt(D)).
+            group_size (int): must be 64.
+            bits (int): must be 8.
+            qw (int): query positions folded per tile; 0 picks the default
+                bq / (n_q_heads / n_kv_heads).
+            bq (int): query rows per threadgroup, 32 or 64; 0 picks 32. 64
+                folds twice the query positions onto each staged KV tile.
+            bk (int): keys staged per tile; 0 picks the stage default (half
+                staging 32, float32 staging 16). 48 is instantiated for half
+                staging at bq 64.
+            splits (int): key-axis split count; 0 picks the depth default.
+            stage (int): staging precision: 0 bfloat16, 1 float16, 2 float32
+                (half tile width; the verification and memory-lever form).
+
+        Returns:
+            array: attention output [1, n_q_heads, qL, 256], float32.
+      )");
+
+  m.def(
+      "sdpa_decode_q8",
+      &mlx_kquant::sdpa_decode_q8,
+      "q"_a,
+      "pk_w"_a,
+      "pk_s"_a,
+      "pk_b"_a,
+      "pv_w"_a,
+      "pv_s"_a,
+      "pv_b"_a,
+      "scale"_a,
+      "group_size"_a = 64,
+      "bits"_a = 8,
+      "splits"_a = 0,
+      "stage"_a = 2,
+      "compute"_a = 1,
+      "tile_c"_a = 0,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Fused q8 decode attention: the KV-attention read for one query row
+        (qL == 1) over a whole QuantizedKVCache tuple (packed uint32, float32
+        scales and biases, group 64, 8 bits). Float32 queries and accumulators.
+        The whole GQA group folds into one query tile; the key axis splits into
+        contiguous chunks each streamed once through threadgroup staging
+        dequantized with fma(scale, q, bias) (the exact mx form), with a
+        per-split online softmax and no score tensor; the partials merge through
+        the same reduction pass as ``sdpa_decode_gqa``. A decode query attends
+        every key (no causal cut inside the past).
+
+        Args:
+            q (array): queries [1, n_q_heads, 1, 256], float32.
+            pk_w, pk_s, pk_b (arrays): K quantized tuple
+                [1, n_kv_heads, N, 64|4|4] (uint32, float32, float32).
+            pv_w, pv_s, pv_b (arrays): V quantized tuple, same geometry.
+            scale (float): query scale (typically 1/sqrt(D)).
+            group_size (int): must be 64.
+            bits (int): must be 8.
+            splits (int): key-axis split count; 0 picks the depth default.
+            stage (int): matrix-tile staging precision: 0 bfloat16, 1 float16,
+                2 float32 (used by compute 0 only).
+            compute (int): compute pattern. 1 (default) is the SIMD-shuffle
+                reduction, the decode-latency form; 0 is the matrix-unit tile.
+            tile_c (int): SIMD-shuffle staged tile height, 8 or 16; 0 the
+                default.
+
+        Returns:
+            array: attention output [1, n_q_heads, 1, 256], float32.
+      )");
+
+  m.def(
       "moe_glu_gather",
       &mlx_kquant::moe_glu_gather,
       "x"_a,

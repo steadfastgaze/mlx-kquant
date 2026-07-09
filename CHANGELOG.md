@@ -7,6 +7,31 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Fused q8 decode attention** (`kq.sdpa_decode_q8`): the served KV-attention
+  read for one query row (qL == 1) over a whole QuantizedKVCache tuple (packed
+  uint32, float32 scales and biases, group 64, 8 bits). The whole GQA group
+  folds into one query tile, the key axis splits into contiguous chunks each
+  streamed once through threadgroup staging dequantized with `fma(scale, q,
+  bias)` (the exact mx form) with a per-split online softmax and no score
+  tensor, and the partials merge through the shared `kq_sdpa_gqa_2pass_2`
+  reduction. Two compute patterns behind the `compute` argument: 1 (default) is
+  the SIMD-shuffle reduction (`sdpa_decode_gqa`'s decode-latency compute with
+  the q8 dequant folded into the cooperative tile load, float staging, `tile_c`
+  8 or 16); 0 is the matrix-unit tile (`sdpa_fa_prefill_q8`'s idiom, `stage`
+  picks its staging precision). Float32 queries and accumulators; a decode query
+  attends every key (no causal cut inside the past). Head dim 256, gqa factor 8
+  (16 query heads over 2 kv heads).
+- **Flash prefill attention, q8 past phase** (`kq.sdpa_fa_prefill_q8`): the
+  serving form of the flash prefill kernel. Float32 queries and accumulators;
+  the past prefix reads directly from a QuantizedKVCache tuple (packed uint32,
+  float32 scales and biases, group 64, 8 bits) and dequantizes with
+  `fma(scale, q, bias)`, the exact mx dequantization form, into half-precision
+  threadgroup staging during the cooperative load; the fresh self chunk stages
+  dense alongside. Staging precision selectable (bfloat16, float16, or float32
+  at a narrower key tile for verification and memory-lever use), query rows
+  per threadgroup 32 or 64, key tile 32 or 48, and a prefill-shaped split
+  default (splits track key depth; the query-tile grid supplies parallelism).
+  No score tensor reaches device memory.
 - **Flash prefill attention** (`kq.sdpa_fa_prefill`): simdgroup-matrix
   head-dim-256 GQA prefill attention over a full query chunk with an online
   softmax and float32 accumulators, so the quadratic score tensor never

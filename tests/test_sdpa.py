@@ -448,6 +448,372 @@ def test_sdpa_fa_prefill_rejects_bad_geometry():
                            mx.zeros((1, 2, 8, 256)), scale)
 
 
+# --- FA prefill, q8 past phase (the serving form) ----------------------------
+
+# Staging-precision bounds: float32 staging carries no staging round, so it
+# holds fp32 grade and doubles as the in-kernel dequant exactness check (a
+# packing or fma defect would blow it up by orders of magnitude). The half
+# stages carry their rounding.
+Q8_STAGE_BOUND = {2: 5e-6, 1: 2e-3, 0: 8e-3}
+
+
+def _make_q8_case(Hq, Hkv, qL, Lp, seed, strided):
+    key = mx.random.key(seed)
+    ks = mx.random.split(key, 6)
+    q = mx.random.normal((1, Hq, qL, 256), key=ks[0]).astype(mx.float32)
+    self_k = mx.random.normal((1, Hkv, qL, 256), key=ks[1]).astype(mx.float32)
+    self_v = mx.random.normal((1, Hkv, qL, 256), key=ks[2]).astype(mx.bfloat16)
+    if strided:
+        # The QuantizedKVCache state form: a seq-sliced view of a longer
+        # buffer, so the head stride exceeds Lp * row.
+        cap = Lp + 256
+        pk = tuple(x[..., :Lp, :] for x in mx.quantize(
+            mx.random.normal((1, Hkv, cap, 256), key=ks[3]).astype(mx.float32),
+            group_size=64, bits=8))
+        pv = tuple(x[..., :Lp, :] for x in mx.quantize(
+            mx.random.normal((1, Hkv, cap, 256), key=ks[4]).astype(mx.float32),
+            group_size=64, bits=8))
+    else:
+        pk = mx.quantize(
+            mx.random.normal((1, Hkv, Lp, 256), key=ks[3]).astype(mx.float32),
+            group_size=64, bits=8)
+        pv = mx.quantize(
+            mx.random.normal((1, Hkv, Lp, 256), key=ks[4]).astype(mx.float32),
+            group_size=64, bits=8)
+    mx.eval(q, self_k, self_v, list(pk), list(pv))
+    return q, pk, pv, self_k, self_v
+
+
+def _ref_q8_prefill(q, pk, pv, self_k, self_v, scale):
+    """f32 composed reference over the mx-dequantized past concatenated with
+    the dense self chunk; query p attends keys <= Lp + p."""
+    Hq, Hkv = q.shape[1], pk[0].shape[1]
+    Lp, qL = pk[0].shape[2], q.shape[2]
+    g = Hq // Hkv
+    kf = mx.concatenate(
+        [mx.dequantize(*pk, group_size=64, bits=8),
+         self_k.astype(mx.float32)], axis=2)
+    vf = mx.concatenate(
+        [mx.dequantize(*pv, group_size=64, bits=8),
+         self_v.astype(mx.float32)], axis=2)
+    kr = mx.repeat(kf, g, axis=1)
+    vr = mx.repeat(vf, g, axis=1)
+    s = (q * scale) @ kr.swapaxes(-1, -2)
+    kL = Lp + qL
+    rows = (Lp + mx.arange(qL)).reshape(qL, 1)
+    cols = mx.arange(kL).reshape(1, kL)
+    s = mx.where(cols <= rows, s, float("-inf"))
+    return mx.softmax(s, axis=-1, precise=True) @ vr
+
+
+def _check_q8(Hq, Hkv, qL, Lp, stage, seed=0, strided=False, qw=0, bq=0,
+              bk=0, splits=0):
+    scale = 1.0 / 16.0
+    q, pk, pv, self_k, self_v = _make_q8_case(Hq, Hkv, qL, Lp, seed, strided)
+    got = kq.sdpa_fa_prefill_q8(q, *pk, *pv, self_k, self_v, scale,
+                                qw=qw, bq=bq, bk=bk, splits=splits,
+                                stage=stage)
+    ref = _ref_q8_prefill(q, pk, pv, self_k, self_v, scale)
+    _eval_or_skip(got, ref)
+    rel = _rel(got, ref)
+    bound = Q8_STAGE_BOUND[stage]
+    print(
+        f"  [prefill-q8] Hq={Hq} Hkv={Hkv} qL={qL} Lp={Lp} stage={stage} "
+        f"bq={bq or 32} bk={bk or 'auto'}: rel={rel:.3e}"
+    )
+    assert rel < bound, f"stage={stage} rel {rel:.3e} >= {bound:.0e}"
+    assert got.dtype == mx.float32
+    assert got.shape == q.shape
+
+
+@pytest.mark.parametrize("bq", [32, 64])
+def test_sdpa_fa_prefill_q8_dequant_exact(bq):
+    # Float32 staging carries no staging round: fp32-grade agreement with the
+    # mx.dequantize-based reference proves the in-kernel fma dequant matches
+    # mx dequantization on real packed words. BQ=64 is the shipping-default
+    # width for the float32 staging (BK pins at 16 for both widths).
+    _check_q8(16, 2, qL=512, Lp=2048, stage=2, bq=bq)
+    _check_q8(16, 2, qL=100, Lp=97, stage=2, bq=bq)
+
+
+@pytest.mark.parametrize("stage", [0, 1])
+def test_sdpa_fa_prefill_q8_half_stages(stage):
+    _check_q8(16, 2, qL=512, Lp=2048, stage=stage)
+
+
+@pytest.mark.parametrize("stage", [0, 1])
+def test_sdpa_fa_prefill_q8_serving_width(stage):
+    # BQ=64 with BK=48: the serving tile widths for the 16:2 GQA, head-dim-256
+    # serving geometry.
+    _check_q8(16, 2, qL=512, Lp=2048, stage=stage, bq=64, bk=48)
+    _check_q8(16, 2, qL=100, Lp=97, stage=stage, bq=64, bk=48)
+
+
+def test_sdpa_fa_prefill_q8_unaligned_and_strided():
+    _check_q8(16, 2, qL=33, Lp=64, stage=1, splits=16)
+    _check_q8(16, 2, qL=512, Lp=2048, stage=1, strided=True, bq=64, bk=48)
+
+
+def test_sdpa_fa_prefill_q8_half_precision_scales():
+    # A float32-key, bfloat16-value cache stores bfloat16 V scales and biases
+    # (the to_quantized conversion path); the op casts them to float32, which
+    # is value-preserving, so the result matches the reference over the same
+    # dequantized values.
+    key = mx.random.key(7)
+    ks = mx.random.split(key, 5)
+    q = mx.random.normal((1, 16, 128, 256), key=ks[0]).astype(mx.float32)
+    self_k = mx.random.normal((1, 2, 128, 256), key=ks[1]).astype(mx.float32)
+    self_v = mx.random.normal((1, 2, 128, 256), key=ks[2]).astype(mx.bfloat16)
+    pk = mx.quantize(
+        mx.random.normal((1, 2, 256, 256), key=ks[3]).astype(mx.float32),
+        group_size=64, bits=8)
+    pv = mx.quantize(
+        mx.random.normal((1, 2, 256, 256), key=ks[4]).astype(mx.bfloat16),
+        group_size=64, bits=8)
+    assert pv[1].dtype == mx.bfloat16
+    mx.eval(q, self_k, self_v, list(pk), list(pv))
+    scale = 1.0 / 16.0
+    got = kq.sdpa_fa_prefill_q8(q, *pk, *pv, self_k, self_v, scale,
+                                bq=64, bk=48, stage=1)
+    ref = _ref_q8_prefill(q, pk, pv, self_k, self_v, scale)
+    _eval_or_skip(got, ref)
+    rel = _rel(got, ref)
+    print(f"  [prefill-q8] bf16 V scales: rel={rel:.3e}")
+    assert rel < Q8_STAGE_BOUND[1]
+
+
+def test_sdpa_fa_prefill_q8_rejects_bad_contract():
+    scale = 1.0 / 16.0
+    q, pk, pv, self_k, self_v = _make_q8_case(16, 2, qL=8, Lp=64, seed=1,
+                                              strided=False)
+    # group size / bits off contract.
+    with pytest.raises(ValueError):
+        kq.sdpa_fa_prefill_q8(q, *pk, *pv, self_k, self_v, scale,
+                              group_size=32)
+    with pytest.raises(ValueError):
+        kq.sdpa_fa_prefill_q8(q, *pk, *pv, self_k, self_v, scale, bits=4)
+    # non-float32 queries.
+    with pytest.raises(ValueError):
+        kq.sdpa_fa_prefill_q8(q.astype(mx.bfloat16), *pk, *pv, self_k,
+                              self_v, scale)
+    # empty past (the dense kernel serves an empty cache).
+    with pytest.raises(ValueError):
+        empty_pk = tuple(x[..., :0, :] for x in pk)
+        empty_pv = tuple(x[..., :0, :] for x in pv)
+        kq.sdpa_fa_prefill_q8(q, *empty_pk, *empty_pv, self_k, self_v, scale)
+    # bk not instantiated for the stage (float staging is bk 16 only).
+    with pytest.raises(ValueError):
+        kq.sdpa_fa_prefill_q8(q, *pk, *pv, self_k, self_v, scale, bk=48,
+                              stage=2)
+    # bk 48 requires the 64-row tile.
+    with pytest.raises(ValueError):
+        kq.sdpa_fa_prefill_q8(q, *pk, *pv, self_k, self_v, scale, bk=48,
+                              bq=32, stage=1)
+
+
+# --- fused q8 decode attention (the served KV-attention read) ----------------
+
+# Staging-precision bounds: float32 staging carries no staging round, so it
+# holds fp32 grade and doubles as the in-kernel dequant exactness check (a
+# packing or fma defect blows it up by orders of magnitude). The half stages
+# carry their rounding.
+Q8_DECODE_BOUND = {2: 5e-6, 1: 2e-3, 0: 8e-3}
+
+
+def _make_q8_decode_case(Hq, Hkv, N, seed, strided):
+    key = mx.random.key(seed)
+    ks = mx.random.split(key, 4)
+    q = mx.random.normal((1, Hq, 1, 256), key=ks[0]).astype(mx.float32)
+    if strided:
+        # The QuantizedKVCache state form: a seq-sliced view of a longer buffer,
+        # so the head stride exceeds N * row.
+        cap = N + 256
+        pk = tuple(x[..., :N, :] for x in mx.quantize(
+            mx.random.normal((1, Hkv, cap, 256), key=ks[1]).astype(mx.float32),
+            group_size=64, bits=8))
+        pv = tuple(x[..., :N, :] for x in mx.quantize(
+            mx.random.normal((1, Hkv, cap, 256), key=ks[2]).astype(mx.float32),
+            group_size=64, bits=8))
+    else:
+        pk = mx.quantize(
+            mx.random.normal((1, Hkv, N, 256), key=ks[1]).astype(mx.float32),
+            group_size=64, bits=8)
+        pv = mx.quantize(
+            mx.random.normal((1, Hkv, N, 256), key=ks[2]).astype(mx.float32),
+            group_size=64, bits=8)
+    mx.eval(q, list(pk), list(pv))
+    return q, pk, pv
+
+
+def _ref_q8_decode(q, pk, pv, scale):
+    """f32 composed reference over the mx-dequantized cache: one query attends
+    every key (no causal cut)."""
+    Hq, Hkv = q.shape[1], pk[0].shape[1]
+    g = Hq // Hkv
+    kf = mx.dequantize(*pk, group_size=64, bits=8)
+    vf = mx.dequantize(*pv, group_size=64, bits=8)
+    kr = mx.repeat(kf, g, axis=1)
+    vr = mx.repeat(vf, g, axis=1)
+    s = (q * scale) @ kr.swapaxes(-1, -2)
+    return mx.softmax(s, axis=-1, precise=True) @ vr
+
+
+def _check_q8_decode(N, stage=2, Hq=16, Hkv=2, seed=0, strided=False, splits=0,
+                     compute=1, tile_c=0):
+    scale = 1.0 / 16.0
+    q, pk, pv = _make_q8_decode_case(Hq, Hkv, N, seed, strided)
+    got = kq.sdpa_decode_q8(q, *pk, *pv, scale, splits=splits, stage=stage,
+                            compute=compute, tile_c=tile_c)
+    ref = _ref_q8_decode(q, pk, pv, scale)
+    _eval_or_skip(got, ref)
+    rel = _rel(got, ref)
+    # The SIMD-shuffle path (compute 1) always stages float; only compute 0
+    # carries the stage-precision round, so the bound tracks the actual staging.
+    bound = 5e-6 if compute == 1 else Q8_DECODE_BOUND[stage]
+    print(
+        f"  [decode-q8] N={N:6d} compute={compute} stage={stage} "
+        f"splits={splits or 'auto'} tile_c={tile_c or 'auto'}: rel={rel:.3e}"
+    )
+    assert rel < bound, f"N={N} compute={compute} rel {rel:.3e} >= {bound:.0e}"
+    assert got.dtype == mx.float32
+    assert got.shape == q.shape
+
+
+# Past lengths spanning group-64 boundaries, split-count edges, and depth. The
+# float32 staging arm doubles as the in-kernel dequant bit-exactness check.
+@pytest.mark.parametrize(
+    "N", [63, 64, 65, 127, 128, 129, 2047, 2048, 2049, 4096, 4123, 37000]
+)
+def test_sdpa_decode_q8_edges_f32(N):
+    # Matrix-tile compute (compute 0), float32 staging: the dequant-exactness
+    # arm and the split/group edge sweep.
+    _check_q8_decode(N, stage=2, seed=N, compute=0)
+
+
+# The SIMD-shuffle compute (compute 1) is the decode-latency serving form; it
+# stages float and dequantizes during the cooperative tile load, so its
+# fp32-grade agreement doubles as its own dequant-exactness check across the
+# same group-64 and split-count edges.
+@pytest.mark.parametrize(
+    "N", [63, 64, 65, 127, 128, 129, 2047, 2048, 2049, 4096, 4123, 37000]
+)
+def test_sdpa_decode_q8_edges_shuffle(N):
+    _check_q8_decode(N, seed=N, compute=1)
+
+
+@pytest.mark.parametrize("tile_c", [8, 16])
+def test_sdpa_decode_q8_shuffle_tile_c(tile_c):
+    _check_q8_decode(4096, seed=51 + tile_c, compute=1, tile_c=tile_c)
+    _check_q8_decode(3071, seed=61 + tile_c, compute=1, tile_c=tile_c, splits=16)
+
+
+def test_sdpa_decode_q8_shuffle_strided_and_splits():
+    _check_q8_decode(2048, compute=1, strided=True, seed=71)
+    for splits in (1, 8, 16, 64):
+        _check_q8_decode(3071, compute=1, seed=80 + splits, splits=splits)
+
+
+def test_sdpa_decode_q8_shuffle_matches_matrix_tile():
+    # Both compute paths attend the same q8 values at fp32 grade, so they agree
+    # with each other within accumulation-order noise on served shapes.
+    scale = 1.0 / 16.0
+    q, pk, pv = _make_q8_decode_case(16, 2, 4096, seed=123, strided=False)
+    got0 = kq.sdpa_decode_q8(q, *pk, *pv, scale, compute=0, stage=2)
+    got1 = kq.sdpa_decode_q8(q, *pk, *pv, scale, compute=1)
+    _eval_or_skip(got0, got1)
+    rel = _rel(got1, got0)
+    print(f"  [decode-q8] shuffle vs matrix-tile: rel={rel:.3e}")
+    assert rel < 5e-6
+
+
+@pytest.mark.parametrize("stage", [0, 1])
+@pytest.mark.parametrize("N", [64, 2048, 4096])
+def test_sdpa_decode_q8_half_stages(stage, N):
+    # Matrix-tile staging precision (compute 0); the SIMD-shuffle path stages
+    # float only.
+    _check_q8_decode(N, stage=stage, seed=N + 3, compute=0)
+
+
+def test_sdpa_decode_q8_strided():
+    # A seq-sliced cache view (head stride > N * row): the op reads it in place.
+    _check_q8_decode(2048, stage=2, strided=True, seed=91, compute=0)
+    _check_q8_decode(4097, stage=1, strided=True, seed=92, compute=0)
+
+
+def test_sdpa_decode_q8_explicit_splits():
+    # Off-boundary depths at several fixed split counts (empty-split partials at
+    # the tail must merge with weight zero).
+    for splits in (1, 8, 16, 64):
+        _check_q8_decode(3071, stage=2, seed=100 + splits, splits=splits,
+                         compute=0)
+
+
+def test_sdpa_decode_q8_dequant_exact():
+    # Float32 staging carries no staging round: fp32-grade agreement with the
+    # mx.dequantize-based reference proves the in-kernel fma dequant matches mx
+    # dequantization on real packed words at a group boundary and past it.
+    _check_q8_decode(64, stage=2, seed=7, compute=0)
+    _check_q8_decode(65, stage=2, seed=8, compute=0)
+    _check_q8_decode(37000, stage=2, seed=9, compute=0)
+
+
+def test_sdpa_decode_q8_half_precision_scales():
+    # A bfloat16-value cache stores bfloat16 V scales and biases (the
+    # to_quantized conversion path); the op casts them to float32, which is
+    # value-preserving, so the result matches the reference over the same
+    # dequantized values.
+    key = mx.random.key(21)
+    ks = mx.random.split(key, 3)
+    q = mx.random.normal((1, 16, 1, 256), key=ks[0]).astype(mx.float32)
+    pk = mx.quantize(
+        mx.random.normal((1, 2, 512, 256), key=ks[1]).astype(mx.float32),
+        group_size=64, bits=8)
+    pv = mx.quantize(
+        mx.random.normal((1, 2, 512, 256), key=ks[2]).astype(mx.bfloat16),
+        group_size=64, bits=8)
+    assert pv[1].dtype == mx.bfloat16
+    mx.eval(q, list(pk), list(pv))
+    scale = 1.0 / 16.0
+    got = kq.sdpa_decode_q8(q, *pk, *pv, scale, stage=1, compute=0)
+    ref = _ref_q8_decode(q, pk, pv, scale)
+    _eval_or_skip(got, ref)
+    rel = _rel(got, ref)
+    print(f"  [decode-q8] bf16 V scales: rel={rel:.3e}")
+    assert rel < Q8_DECODE_BOUND[1]
+
+
+def test_sdpa_decode_q8_rejects_bad_contract():
+    scale = 1.0 / 16.0
+    q, pk, pv = _make_q8_decode_case(16, 2, N=64, seed=1, strided=False)
+    # group size / bits off contract.
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_q8(q, *pk, *pv, scale, group_size=32)
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_q8(q, *pk, *pv, scale, bits=4)
+    # non-float32 queries.
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_q8(q.astype(mx.bfloat16), *pk, *pv, scale)
+    # qL > 1 is the prefill kernel's shape.
+    with pytest.raises(ValueError):
+        q2 = mx.zeros((1, 16, 2, 256), dtype=mx.float32)
+        kq.sdpa_decode_q8(q2, *pk, *pv, scale)
+    # empty cache.
+    with pytest.raises(ValueError):
+        empty_pk = tuple(x[..., :0, :] for x in pk)
+        empty_pv = tuple(x[..., :0, :] for x in pv)
+        kq.sdpa_decode_q8(q, *empty_pk, *empty_pv, scale)
+    # off-contract fold (only gqa factor 8 is instantiated).
+    with pytest.raises(ValueError):
+        q4 = mx.zeros((1, 8, 1, 256), dtype=mx.float32)  # 8 q heads / 2 kv = 4
+        kq.sdpa_decode_q8(q4, *pk, *pv, scale)
+    # unknown compute mode.
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_q8(q, *pk, *pv, scale, compute=2)
+    # off-contract SIMD-shuffle tile height.
+    with pytest.raises(ValueError):
+        kq.sdpa_decode_q8(q, *pk, *pv, scale, compute=1, tile_c=32)
+
+
 @pytest.mark.parametrize("D", [256, 512])
 @pytest.mark.parametrize("qL", [1, 4])
 def test_sdpa_vector_bool_mask(D, qL):

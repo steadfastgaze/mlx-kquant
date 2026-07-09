@@ -293,6 +293,70 @@ mx::array sdpa_fa_prefill(
     int splits = 0,
     mx::StreamOrDevice s = {});
 
+// The serving form of sdpa_fa_prefill: float32 queries and accumulators, with
+// the past prefix read directly from a QuantizedKVCache tuple (packed uint32,
+// float32 scales and biases, group 64, 8 bits) and the fresh self-chunk keys
+// and values read dense float32. Past tiles dequantize with fma(scale, q,
+// bias), the exact mx dequantization form, into StageT threadgroup staging
+// during the cooperative load; self tiles cast from float32. `stage` selects
+// the staging precision: 0 bfloat16, 1 float16 (both full tile width), 2
+// float32 (half tile width; the dequant-exactness verification arm and the
+// memory-lever fallback). Query position p attends keys <= past_len + p on the
+// combined axis, so past keys are unmasked and the self chunk causal. Requires
+// B == 1, head_dim 256, float32 q and self k/v, (Hq / Hkv) * qw == 32.
+// Metal-only.
+mx::array sdpa_fa_prefill_q8(
+    mx::array q,
+    mx::array pk_w,
+    mx::array pk_s,
+    mx::array pk_b,
+    mx::array pv_w,
+    mx::array pv_s,
+    mx::array pv_b,
+    mx::array self_k,
+    mx::array self_v,
+    float scale,
+    int group_size = 64,
+    int bits = 8,
+    int qw = 0,
+    int bq = 0,
+    int bk = 0,
+    int splits = 0,
+    int stage = 0,
+    mx::StreamOrDevice s = {});
+
+// Fused q8 decode attention: the KV-attention read for one query row (qL == 1)
+// over a whole QuantizedKVCache tuple (packed uint32, float32 scales and
+// biases, group 64, 8 bits). Float32 queries and accumulators. The whole GQA
+// group folds into one query tile; the key axis splits into contiguous chunks
+// each streamed once through StageT threadgroup staging dequantized with
+// fma(scale, q, bias) (the exact mx form), with a per-split online softmax and
+// no score tensor; the partials merge through the shared kq_sdpa_gqa 2-pass
+// reduction. A decode query attends every key (no causal cut inside the past).
+// `compute` selects the compute pattern: 1 (default) is the SIMD-shuffle
+// reduction, the decode-latency form; 0 is the matrix-unit tile (the prefill_q8
+// idiom, faster at prefill width but not at one query row). `stage` selects the
+// matrix-tile staging precision (0 bfloat16, 1 float16, 2 float32); the
+// SIMD-shuffle path stages float. `tile_c` picks the SIMD-shuffle staged tile
+// height (8 or 16; 0 the default). Requires B == 1, head_dim 256, float32 q,
+// (Hq / Hkv) == 8, past length >= 1. Metal-only.
+mx::array sdpa_decode_q8(
+    mx::array q,
+    mx::array pk_w,
+    mx::array pk_s,
+    mx::array pk_b,
+    mx::array pv_w,
+    mx::array pv_s,
+    mx::array pv_b,
+    float scale,
+    int group_size = 64,
+    int bits = 8,
+    int splits = 0,
+    int stage = 2,
+    int compute = 1,
+    int tile_c = 0,
+    mx::StreamOrDevice s = {});
+
 // Fused MoE GLU gather on the MLX packed mxfp4 layout: gate and up expert
 // matvecs (sharing each activation load), expert biases, and the clamped
 // SwiGLU epilogue out = (min(g, limit) * sigmoid(alpha * g)) * (clip(u,
@@ -693,6 +757,93 @@ class KQuantSDPAFAPrefill : public mx::Primitive {
   float scale_;
   int qw_;
   int splits_;
+};
+
+// Simdgroup-matrix FA prefill attention, q8 past phase (see
+// sdpa_fa_prefill_q8). Inference-only.
+class KQuantSDPAFAPrefillQ8 : public mx::Primitive {
+ public:
+  explicit KQuantSDPAFAPrefillQ8(
+      mx::Stream stream,
+      float scale,
+      int qw,
+      int bq,
+      int bk,
+      int splits,
+      int stage)
+      : mx::Primitive(stream),
+        scale_(scale),
+        qw_(qw),
+        bq_(bq),
+        bk_(bk),
+        splits_(splits),
+        stage_(stage) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantSDPAFAPrefillQ8";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float scale_;
+  int qw_;
+  int bq_;
+  int bk_;
+  int splits_;
+  int stage_;
+};
+
+// Fused q8 decode attention (see sdpa_decode_q8). Inference-only. `compute`
+// selects the compute pattern: 0 is the matrix-unit tile (the prefill_q8 idiom;
+// `stage` picks its staging precision), 1 is the SIMD-shuffle reduction (the
+// decode-latency form; float staging, one tile height per `tile_c`).
+class KQuantSDPADecodeQ8 : public mx::Primitive {
+ public:
+  explicit KQuantSDPADecodeQ8(
+      mx::Stream stream,
+      float scale,
+      int splits,
+      int stage,
+      int compute,
+      int tile_c)
+      : mx::Primitive(stream),
+        scale_(scale),
+        splits_(splits),
+        stage_(stage),
+        compute_(compute),
+        tile_c_(tile_c) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantSDPADecodeQ8";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float scale_;
+  int splits_;
+  int stage_;
+  int compute_;
+  int tile_c_;
 };
 
 // Fused MoE GLU gather (see moe_glu_gather). Inference-only.
