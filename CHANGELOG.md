@@ -7,6 +7,12 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `sdpa_decode_q8(..., dimension_parallel_merge=True)` adds an opt-in
+  dimension-parallel pass-two kernel for the 16-query-head, 2-KV-head,
+  head-dim-256, split-128, tile-16 serving geometry at cache depths of at least
+  8192. It preserves the shared merge's max, denominator, and per-output split
+  order while assigning 32 output dimensions to each of eight SIMD groups.
+  Off-contract calls retain the shared merge.
 - **Fused q8 decode attention** (`kq.sdpa_decode_q8`): the served KV-attention
   read for one query row (qL == 1) over a whole QuantizedKVCache tuple (packed
   uint32, float32 scales and biases, group 64, 8 bits). The whole GQA group
@@ -73,6 +79,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   op level.
 
 ### Changed
+- Tile-16 fused q8 decode attention loads each four-word packed K/V span with
+  one aligned `uint4` read. The dequantization arithmetic, staging indices,
+  dynamic cache strides, and reduction order are unchanged. Misaligned cache
+  rows fall back to the scalar loader. `KQ_SDPA_Q8_UINT4_LOAD=0` retains the
+  scalar path as an exact A/B control.
 - SwiGLU epilogues pin `metal::precise::exp`; the softmax fast::exp sites
   carry an annotation for why the fast form stays.
 

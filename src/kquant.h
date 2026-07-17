@@ -3,6 +3,7 @@
 // and quantize).
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
@@ -24,6 +25,15 @@ std::string metallib_dir();
 // Load the bundled metallib via MLX's Metal device. Throws on failure.
 // Returns false only on a non-Metal build.
 bool metallib_loads();
+
+// Q8 decode-loader state. KQ_SDPA_Q8_UINT4_LOAD=1 selects aligned uint4 reads;
+// 0 retains the scalar-word control. The aligned default converts packed bytes
+// as uchar4 vectors; KQ_SDPA_Q8_VECTOR_BYTE_UNPACK=0 retains scalar byte
+// extraction. Every arm uses the array-provided sequence strides. Dispatch
+// counters are ordered as scalar_dynamic, uint4_dynamic,
+// uint4_byte_dynamic, off_contract.
+std::string sdpa_q8_loader_arm();
+std::vector<uint64_t> sdpa_q8_loader_dispatch_counts();
 
 // ----------------------------- ops -----------------------------
 
@@ -338,7 +348,10 @@ mx::array sdpa_fa_prefill_q8(
 // idiom, faster at prefill width but not at one query row). `stage` selects the
 // matrix-tile staging precision (0 bfloat16, 1 float16, 2 float32); the
 // SIMD-shuffle path stages float. `tile_c` picks the SIMD-shuffle staged tile
-// height (8 or 16; 0 the default). Requires B == 1, head_dim 256, float32 q,
+// height (8 or 16; 0 the default). `dimension_parallel_merge` selects an
+// exact-order pass-two specialization for the 16:2, split-128, tile-16 serving
+// geometry at cache depths of at least 8192 and falls back to the shared merge
+// for every other shape. Requires B == 1, head_dim 256, float32 q,
 // (Hq / Hkv) == 8, past length >= 1. Metal-only.
 mx::array sdpa_decode_q8(
     mx::array q,
@@ -355,6 +368,7 @@ mx::array sdpa_decode_q8(
     int stage = 2,
     int compute = 1,
     int tile_c = 0,
+    bool dimension_parallel_merge = false,
     mx::StreamOrDevice s = {});
 
 // Fused MoE GLU gather on the MLX packed mxfp4 layout: gate and up expert
@@ -815,13 +829,15 @@ class KQuantSDPADecodeQ8 : public mx::Primitive {
       int splits,
       int stage,
       int compute,
-      int tile_c)
+      int tile_c,
+      bool dimension_parallel_merge)
       : mx::Primitive(stream),
         scale_(scale),
         splits_(splits),
         stage_(stage),
         compute_(compute),
-        tile_c_(tile_c) {}
+        tile_c_(tile_c),
+        dimension_parallel_merge_(dimension_parallel_merge) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -844,6 +860,7 @@ class KQuantSDPADecodeQ8 : public mx::Primitive {
   int stage_;
   int compute_;
   int tile_c_;
+  bool dimension_parallel_merge_;
 };
 
 // Fused MoE GLU gather (see moe_glu_gather). Inference-only.

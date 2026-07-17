@@ -258,6 +258,14 @@ All optional; the defaults are right for normal use.
   matmul, which is bit-exact (the NEON path is tolerance-level; see [How it works](#how-it-works)).
 - `KQ_DISABLE_VERIFY_QMV=1` - on Metal, force the plain per-row `qmv` path instead of the
   weight-read-amortizing `verify_qmv` kernel. An A/B debugging lever, not a tuning knob.
+- `KQ_SDPA_Q8_UINT4_LOAD=0` - use scalar packed-word loads in the tile-16 q8 decode-attention
+  kernel instead of the default aligned `uint4` loads. This is an exact A/B control; invalid values
+  fail closed. `KQ_SDPA_Q8_VECTOR_BYTE_UNPACK=0` keeps aligned `uint4` reads but converts each
+  packed byte through the prior scalar extraction sequence instead of the default vector
+  conversion. The byte-unpack setting is ignored when scalar packed-word loads are selected. Both
+  settings are read once when the loader is first inspected or dispatched, so set them before
+  importing or loading a model. `sdpa_q8_loader_debug()` reports the selected arm and dispatch
+  counters.
 
 ## Quant recipes
 

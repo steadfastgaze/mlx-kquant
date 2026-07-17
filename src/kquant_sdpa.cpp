@@ -5,6 +5,9 @@
 // head/seq strides so a strided KV-cache prefix needs no copy. Inference-only
 // (no CPU eval).
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -23,6 +26,66 @@ namespace mx = mlx::core;
 
 namespace mlx_kquant {
 
+namespace {
+
+enum class Q8LoaderArm : size_t {
+  ScalarDynamic = 0,
+  Uint4Dynamic = 1,
+  Uint4ByteDynamic = 2,
+  OffContract = 3,
+};
+
+struct Q8LoaderConfig {
+  const char* suffix;
+  Q8LoaderArm arm;
+};
+
+const Q8LoaderConfig& q8_loader_config() {
+  static const Q8LoaderConfig config = [] {
+    const char* env = std::getenv("KQ_SDPA_Q8_UINT4_LOAD");
+    if (env != nullptr && env[0] != '\0' && std::string(env) == "0") {
+      return Q8LoaderConfig{"scalar_dynamic", Q8LoaderArm::ScalarDynamic};
+    }
+    if (env != nullptr && env[0] != '\0' && std::string(env) != "1") {
+      throw std::runtime_error("KQ_SDPA_Q8_UINT4_LOAD must be 0 or 1.");
+    }
+    const char* unpack = std::getenv("KQ_SDPA_Q8_VECTOR_BYTE_UNPACK");
+    if (
+        unpack == nullptr || unpack[0] == '\0' ||
+        std::string(unpack) == "1") {
+      return Q8LoaderConfig{
+          "uint4_byte_dynamic", Q8LoaderArm::Uint4ByteDynamic};
+    }
+    if (std::string(unpack) == "0") {
+      return Q8LoaderConfig{"uint4_dynamic", Q8LoaderArm::Uint4Dynamic};
+    }
+    throw std::runtime_error("KQ_SDPA_Q8_VECTOR_BYTE_UNPACK must be 0 or 1.");
+  }();
+  return config;
+}
+
+std::array<std::atomic<uint64_t>, 4> q8_loader_dispatch_counts{};
+
+void count_q8_loader_dispatch(Q8LoaderArm arm) {
+  q8_loader_dispatch_counts[static_cast<size_t>(arm)].fetch_add(
+      1, std::memory_order_relaxed);
+}
+
+} // namespace
+
+std::string sdpa_q8_loader_arm() {
+  return q8_loader_config().suffix;
+}
+
+std::vector<uint64_t> sdpa_q8_loader_dispatch_counts() {
+  std::vector<uint64_t> counts;
+  counts.reserve(q8_loader_dispatch_counts.size());
+  for (const auto& count : q8_loader_dispatch_counts) {
+    counts.push_back(count.load(std::memory_order_relaxed));
+  }
+  return counts;
+}
+
 #ifdef _METAL_
 
 namespace {
@@ -30,6 +93,15 @@ namespace {
 using mx::array;
 using mx::Stream;
 using mx::metal::Device;
+
+bool has_uint4_row_alignment(array a) {
+  const size_t head_stride =
+      static_cast<size_t>(a.shape(1) == 1 ? a.strides(0) : a.strides(1));
+  const auto address = reinterpret_cast<uintptr_t>(a.buffer().raw_ptr()) +
+      static_cast<uintptr_t>(a.offset());
+  return address % 16 == 0 && head_stride % 4 == 0 &&
+      static_cast<size_t>(a.strides(2)) % 4 == 0;
+}
 
 // Number of key-blocks to split the reduction across. Mirrors MLX's own
 // sdpa_vector_2pass heuristic: more blocks only when there are enough
@@ -832,8 +904,28 @@ void KQuantSDPADecodeQ8::eval_gpu(
   // idiom). Both write the same float32 [B, Hq, 1, splits, D] partials.
   if (compute_ == 1) {
     int tile_c = tile_c_ != 0 ? tile_c_ : 8;
+    const bool loader_variant_eligible =
+        D == 256 && tile_c == 16 && gqa_factor == 8;
+    Q8LoaderArm dispatched_loader = Q8LoaderArm::OffContract;
+    bool alignment_fallback = false;
     std::string kname = "kq_sdpa_decode_gqa_q8_2pass_1_" + std::to_string(D) +
         "_c" + std::to_string(tile_c) + "_ne4";
+    if (loader_variant_eligible) {
+      const auto& selected_loader = q8_loader_config();
+      const bool uint4_aligned =
+          has_uint4_row_alignment(pk_w) && has_uint4_row_alignment(pv_w);
+      const bool selected_uint4 =
+          selected_loader.arm == Q8LoaderArm::Uint4Dynamic ||
+          selected_loader.arm == Q8LoaderArm::Uint4ByteDynamic;
+      if (selected_uint4 && !uint4_aligned) {
+        kname += "_scalar_dynamic";
+        dispatched_loader = Q8LoaderArm::ScalarDynamic;
+        alignment_fallback = true;
+      } else {
+        kname += "_" + std::string(selected_loader.suffix);
+        dispatched_loader = selected_loader.arm;
+      }
+    }
     std::string hash = kname + "_s" + std::to_string(splits);
     auto kernel = kq_get_kernel(d, kname, hash, fc);
     const size_t tg = size_t(32) * gqa_factor;
@@ -842,6 +934,10 @@ void KQuantSDPADecodeQ8::eval_gpu(
           "[mlx_kquant.sdpa_decode_q8] threadgroup of " + std::to_string(tg) +
           " threads exceeds this GPU's pipeline limit (" +
           std::to_string(kernel->maxTotalThreadsPerThreadgroup()) + ").");
+    }
+    count_q8_loader_dispatch(dispatched_loader);
+    if (alignment_fallback) {
+      count_q8_loader_dispatch(Q8LoaderArm::OffContract);
     }
     ce.set_compute_pipeline_state(kernel);
     ce.set_input_array(q, 0);
@@ -887,12 +983,33 @@ void KQuantSDPADecodeQ8::eval_gpu(
     ce.dispatch_threadgroups(grid_dims, group_dims);
   }
 
-  // Pass 2: the shared kq_sdpa_gqa merge on the float32 output; grid z is the
-  // query axis (1 at decode).
+  // Pass 2: either the shared kq_sdpa_gqa merge or its exact-order,
+  // dimension-parallel fixed-geometry form. The latter changes only which
+  // SIMD group owns each output dimension; max, denominator, and each output
+  // dimension retain the shared merge's reduction order.
   {
-    std::string kname = "kq_sdpa_gqa_2pass_2_float_" + std::to_string(D);
-    std::string hash = kname + "_s" + std::to_string(splits) + "_k0";
-    auto kernel = kq_get_kernel(d, kname, hash, fc);
+    const bool use_dimension_parallel_merge = dimension_parallel_merge_ &&
+        N >= 8192 && splits == 128 && stage_ == 2 && compute_ == 1 &&
+        tile_c_ == 16 && B == 1 && n_q_heads == 16 && n_kv_heads == 2 &&
+        D == 256;
+    const std::string kname = use_dimension_parallel_merge
+        ? "kq_sdpa_q8_merge_dim8"
+        : "kq_sdpa_gqa_2pass_2_float_" + std::to_string(D);
+    MTL::ComputePipelineState* kernel;
+    if (use_dimension_parallel_merge) {
+      kernel = kq_get_kernel(d, kname);
+    } else {
+      const std::string hash = kname + "_s" + std::to_string(splits) + "_k0";
+      kernel = kq_get_kernel(d, kname, hash, fc);
+    }
+    const size_t merge_threads = use_dimension_parallel_merge ? 256 : 32;
+    if (merge_threads > kernel->maxTotalThreadsPerThreadgroup()) {
+      throw std::runtime_error(
+          "[mlx_kquant.sdpa_decode_q8] merge threadgroup of " +
+          std::to_string(merge_threads) +
+          " threads exceeds this GPU's pipeline limit (" +
+          std::to_string(kernel->maxTotalThreadsPerThreadgroup()) + ").");
+    }
     ce.set_compute_pipeline_state(kernel);
     ce.set_input_array(partials, 0);
     ce.set_input_array(sums, 1);
@@ -900,7 +1017,7 @@ void KQuantSDPADecodeQ8::eval_gpu(
     ce.set_input_array(sums, 3);
     ce.set_output_array(out, 4);
     ce.set_bytes(n_q_heads, 5);
-    MTL::Size group_dims(32, 1, 1);
+    MTL::Size group_dims(merge_threads, 1, 1);
     MTL::Size grid_dims(n_q_heads, B, 1);
     ce.dispatch_threadgroups(grid_dims, group_dims);
   }
@@ -1415,7 +1532,8 @@ std::vector<mx::Shape> KQuantSDPADecodeQ8::output_shapes(
 bool KQuantSDPADecodeQ8::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantSDPADecodeQ8&>(other);
   return scale_ == o.scale_ && splits_ == o.splits_ && stage_ == o.stage_ &&
-      compute_ == o.compute_ && tile_c_ == o.tile_c_;
+      compute_ == o.compute_ && tile_c_ == o.tile_c_ &&
+      dimension_parallel_merge_ == o.dimension_parallel_merge_;
 }
 
 mx::array sdpa_fa_prefill_q8(
@@ -1618,6 +1736,7 @@ mx::array sdpa_decode_q8(
     int stage,
     int compute,
     int tile_c,
+    bool dimension_parallel_merge,
     mx::StreamOrDevice s_) {
   auto s = mx::to_stream(s_);
 
@@ -1751,7 +1870,7 @@ mx::array sdpa_decode_q8(
       std::move(out_shape),
       mx::float32,
       std::make_shared<KQuantSDPADecodeQ8>(
-          s, scale, splits, stage, compute, tile_c),
+          s, scale, splits, stage, compute, tile_c, dimension_parallel_merge),
       {std::move(q_c),
        std::move(pk_w_c),
        std::move(pk_s_c),

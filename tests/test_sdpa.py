@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
+import textwrap
 
 import mlx.core as mx
 import pytest
@@ -658,12 +660,31 @@ def _ref_q8_decode(q, pk, pv, scale):
     return mx.softmax(s, axis=-1, precise=True) @ vr
 
 
-def _check_q8_decode(N, stage=2, Hq=16, Hkv=2, seed=0, strided=False, splits=0,
-                     compute=1, tile_c=0):
+def _check_q8_decode(
+    N,
+    stage=2,
+    Hq=16,
+    Hkv=2,
+    seed=0,
+    strided=False,
+    splits=0,
+    compute=1,
+    tile_c=0,
+    dimension_parallel_merge=False,
+):
     scale = 1.0 / 16.0
     q, pk, pv = _make_q8_decode_case(Hq, Hkv, N, seed, strided)
-    got = kq.sdpa_decode_q8(q, *pk, *pv, scale, splits=splits, stage=stage,
-                            compute=compute, tile_c=tile_c)
+    got = kq.sdpa_decode_q8(
+        q,
+        *pk,
+        *pv,
+        scale,
+        splits=splits,
+        stage=stage,
+        compute=compute,
+        tile_c=tile_c,
+        dimension_parallel_merge=dimension_parallel_merge,
+    )
     ref = _ref_q8_decode(q, pk, pv, scale)
     _eval_or_skip(got, ref)
     rel = _rel(got, ref)
@@ -707,6 +728,22 @@ def test_sdpa_decode_q8_shuffle_tile_c(tile_c):
     _check_q8_decode(3071, seed=61 + tile_c, compute=1, tile_c=tile_c, splits=16)
 
 
+def test_sdpa_decode_q8_shuffle_tile16_long_context_engages_loader():
+    loader_before = kq.sdpa_q8_loader_debug()
+    _check_q8_decode(
+        37000,
+        seed=33035,
+        compute=1,
+        tile_c=16,
+        splits=128,
+        dimension_parallel_merge=True,
+    )
+    loader_after = kq.sdpa_q8_loader_debug()
+    selected = loader_before["selected_arm"]
+    assert loader_after[selected] == loader_before[selected] + 1
+    assert loader_after["off_contract"] == loader_before["off_contract"]
+
+
 def test_sdpa_decode_q8_shuffle_strided_and_splits():
     _check_q8_decode(2048, compute=1, strided=True, seed=71)
     for splits in (1, 8, 16, 64):
@@ -724,6 +761,178 @@ def test_sdpa_decode_q8_shuffle_matches_matrix_tile():
     rel = _rel(got1, got0)
     print(f"  [decode-q8] shuffle vs matrix-tile: rel={rel:.3e}")
     assert rel < 5e-6
+
+
+def test_sdpa_decode_q8_dimension_parallel_merge_is_exact():
+    N = 8192
+    scale = 1.0 / 16.0
+    q, pk, pv = _make_q8_decode_case(16, 2, N, seed=19001 + N, strided=False)
+    shared = kq.sdpa_decode_q8(
+        q, *pk, *pv, scale, splits=128, stage=2, compute=1, tile_c=16
+    )
+    parallel = kq.sdpa_decode_q8(
+        q,
+        *pk,
+        *pv,
+        scale,
+        splits=128,
+        stage=2,
+        compute=1,
+        tile_c=16,
+        dimension_parallel_merge=True,
+    )
+    _eval_or_skip(shared, parallel)
+    assert bool(mx.array_equal(shared, parallel))
+
+
+def test_sdpa_decode_q8_uint4_alignment_fallback_is_exact():
+    loader_before = kq.sdpa_q8_loader_debug()
+    selected = loader_before["selected_arm"]
+    if selected not in {"uint4_dynamic", "uint4_byte_dynamic"}:
+        pytest.skip("the scalar kill switch is active")
+
+    scale = 1.0 / 16.0
+    q, pk, pv = _make_q8_decode_case(16, 2, 257, seed=33034, strided=False)
+
+    def unaligned_words(words):
+        prefix = mx.zeros((*words.shape[:-1], 1), dtype=words.dtype)
+        return mx.concatenate((prefix, words), axis=-1)[..., 1:]
+
+    unaligned_pk = (unaligned_words(pk[0]), *pk[1:])
+    unaligned_pv = (unaligned_words(pv[0]), *pv[1:])
+    mx.eval(*unaligned_pk, *unaligned_pv)
+
+    kwargs = {"splits": 16, "stage": 2, "compute": 1, "tile_c": 16}
+    aligned = kq.sdpa_decode_q8(q, *pk, *pv, scale, **kwargs)
+    mx.eval(aligned)
+    loader_after_aligned = kq.sdpa_q8_loader_debug()
+    unaligned = kq.sdpa_decode_q8(
+        q, *unaligned_pk, *unaligned_pv, scale, **kwargs
+    )
+    mx.eval(unaligned)
+    loader_after_unaligned = kq.sdpa_q8_loader_debug()
+
+    assert bool(mx.array_equal(aligned, unaligned))
+    assert (
+        loader_after_aligned[selected]
+        == loader_before[selected] + 1
+    )
+    assert (
+        loader_after_unaligned["scalar_dynamic"]
+        == loader_after_aligned["scalar_dynamic"] + 1
+    )
+    assert (
+        loader_after_unaligned["off_contract"]
+        == loader_after_aligned["off_contract"] + 1
+    )
+
+
+_Q8_UNPACK_HASH = textwrap.dedent(
+    """
+    import hashlib
+
+    import mlx.core as mx
+    import mlx_kquant as kq
+    import numpy as np
+
+    length = 8191
+    capacity = length + 17
+    keys = mx.random.split(mx.random.key(39002), 3)
+    query = mx.random.normal((1, 16, 1, 256), key=keys[0]).astype(mx.float32)
+    key = mx.random.normal((1, 2, capacity, 256), key=keys[1]).astype(mx.float32)
+    value = mx.random.normal((1, 2, capacity, 256), key=keys[2]).astype(mx.float32)
+    packed_key = tuple(
+        part[:, :, :length, :]
+        for part in mx.quantize(key, group_size=64, bits=8)
+    )
+    packed_value = tuple(
+        part[:, :, :length, :]
+        for part in mx.quantize(value, group_size=64, bits=8)
+    )
+    counters_before = kq.sdpa_q8_loader_debug()
+    output = kq.sdpa_decode_q8(
+        query,
+        *packed_key,
+        *packed_value,
+        1.0 / 16.0,
+        group_size=64,
+        bits=8,
+        splits=128,
+        stage=2,
+        compute=1,
+        tile_c=16,
+        dimension_parallel_merge=True,
+    )
+    mx.eval(output)
+    counters_after = kq.sdpa_q8_loader_debug()
+    selected = counters_after["selected_arm"]
+    print(selected)
+    print(counters_after[selected] - counters_before[selected])
+    print(counters_after["scalar_dynamic"] - counters_before["scalar_dynamic"])
+    print(counters_after["off_contract"] - counters_before["off_contract"])
+    print(hashlib.sha256(np.asarray(output).tobytes()).hexdigest())
+    """
+)
+
+
+def _q8_unpack_hash(vector_unpack: str) -> tuple[str, int, int, int, str]:
+    env = dict(os.environ)
+    env["KQ_SDPA_Q8_UINT4_LOAD"] = "1"
+    env["KQ_SDPA_Q8_VECTOR_BYTE_UNPACK"] = vector_unpack
+    proc = subprocess.run(
+        [sys.executable, "-c", _Q8_UNPACK_HASH],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    arm, selected_calls, scalar_calls, off_contract, output_hash = (
+        proc.stdout.strip().splitlines()
+    )
+    return (
+        arm,
+        int(selected_calls),
+        int(scalar_calls),
+        int(off_contract),
+        output_hash,
+    )
+
+
+def test_sdpa_decode_q8_vector_byte_unpack_is_bitwise_exact():
+    if mx.default_device() == mx.cpu:
+        pytest.skip("the q8 decode loader is a GPU kernel path")
+    control_arm, control_calls, control_scalar, control_off, control_hash = (
+        _q8_unpack_hash("0")
+    )
+    candidate_arm, candidate_calls, candidate_scalar, candidate_off, candidate_hash = (
+        _q8_unpack_hash("1")
+    )
+    assert control_arm == "uint4_dynamic"
+    assert candidate_arm == "uint4_byte_dynamic"
+    assert control_calls == candidate_calls == 1
+    assert control_scalar == candidate_scalar == 0
+    assert control_off == candidate_off == 0
+    assert candidate_hash == control_hash
+
+
+@pytest.mark.parametrize(
+    ("N", "kwargs"),
+    [
+        (8191, {"splits": 128, "stage": 2, "compute": 1, "tile_c": 16}),
+        (8192, {"splits": 64, "stage": 2, "compute": 1, "tile_c": 16}),
+        (8192, {"splits": 128, "stage": 2, "compute": 1, "tile_c": 8}),
+        (8192, {"splits": 128, "stage": 1, "compute": 1, "tile_c": 16}),
+    ],
+)
+def test_sdpa_decode_q8_dimension_parallel_merge_falls_back(N, kwargs):
+    scale = 1.0 / 16.0
+    q, pk, pv = _make_q8_decode_case(16, 2, N, seed=19002, strided=False)
+    shared = kq.sdpa_decode_q8(q, *pk, *pv, scale, **kwargs)
+    fallback = kq.sdpa_decode_q8(
+        q, *pk, *pv, scale, dimension_parallel_merge=True, **kwargs
+    )
+    _eval_or_skip(shared, fallback)
+    assert bool(mx.array_equal(shared, fallback))
 
 
 @pytest.mark.parametrize("stage", [0, 1])

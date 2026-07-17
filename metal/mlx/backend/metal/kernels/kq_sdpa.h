@@ -1506,7 +1506,12 @@ template <typename StageT, int D, int BQ>
 // heads; a decode query attends every key (no causal band inside the past);
 // only the split tail past N zero-fills. Partials merge through
 // kq_sdpa_gqa_2pass_2 unchanged.
-template <int D, int C = 8, int NE = 4>
+template <
+    int D,
+    int C = 8,
+    int NE = 4,
+    bool AlignedUint4Load = false,
+    bool VectorByteUnpack = false>
 [[kernel]] void kq_sdpa_decode_gqa_q8_2pass_1(
     const device float* queries [[buffer(0)]],
     const device uint32_t* pk_w [[buffer(1)]],
@@ -1526,7 +1531,6 @@ template <int D, int C = 8, int NE = 4>
   constexpr int D4 = D / 4;
   constexpr int NL = 32 / NE; // lanes per in-flight key
   constexpr int DP4 = D4 / NL; // float4s per lane per key row
-  constexpr int kWPR = D / 4; // packed words per key row (one word -> 4 elems)
 
   threadgroup float4 sK[C * D4];
   threadgroup float4 sV[C * D4];
@@ -1550,8 +1554,7 @@ template <int D, int C = 8, int NE = 4>
   const int k0 = split_idx * chunk;
   const int k1 = min(k0 + chunk, N);
 
-  const size_t hk =
-      (size_t)(batch_idx * num_kv_heads + kv_head_idx);
+  const size_t hk = (size_t)(batch_idx * num_kv_heads + kv_head_idx);
 
   // Pre-scaled query slices for this lane's key-row columns ([B, Hq, 1, D],
   // row-contiguous).
@@ -1578,36 +1581,93 @@ template <int D, int C = 8, int NE = 4>
     // float4 (four head-dim elements) per step from one packed word; the tail
     // past k1 zero-fills so stale threadgroup data never reaches the
     // accumulators.
-    for (int i = flat; i < C * D4; i += n_threads) {
-      const int row = i / D4;
-      const int col = i % D4; // 0..kWPR-1; packed-word index for this float4
-      const int kg = kt + row;
-      if (kg < k1) {
-        const uint32_t kw =
-            pk_w[hk * p.pk_head + (size_t)kg * p.pk_seq + col];
-        const size_t kgb =
-            hk * p.pks_head + (size_t)kg * p.pks_seq + (col >> 4);
-        const float ks = pk_s[kgb];
-        const float kb = pk_b[kgb];
-        sK[i] = float4(
-            fma(ks, float(kw & 0xff), kb),
-            fma(ks, float((kw >> 8) & 0xff), kb),
-            fma(ks, float((kw >> 16) & 0xff), kb),
-            fma(ks, float((kw >> 24) & 0xff), kb));
-        const uint32_t vw =
-            pv_w[hk * p.pv_head + (size_t)kg * p.pv_seq + col];
-        const size_t vgb =
-            hk * p.pvs_head + (size_t)kg * p.pvs_seq + (col >> 4);
-        const float vs_ = pv_s[vgb];
-        const float vb = pv_b[vgb];
-        sV[i] = float4(
-            fma(vs_, float(vw & 0xff), vb),
-            fma(vs_, float((vw >> 8) & 0xff), vb),
-            fma(vs_, float((vw >> 16) & 0xff), vb),
-            fma(vs_, float((vw >> 24) & 0xff), vb));
-      } else {
-        sK[i] = float4(0);
-        sV[i] = float4(0);
+    if constexpr (AlignedUint4Load) {
+      // Four consecutive words cover sixteen values inside one group-64
+      // scale/bias block. The row base and four-word column are 16-byte
+      // aligned at the fixed D=256 serving geometry.
+      constexpr int kWordsPerVector = 4;
+      constexpr int kVectorsPerRow = D4 / kWordsPerVector;
+      for (int vi = flat; vi < C * kVectorsPerRow; vi += n_threads) {
+        const int row = vi / kVectorsPerRow;
+        const int col = (vi % kVectorsPerRow) * kWordsPerVector;
+        const int kg = kt + row;
+        if (kg < k1) {
+          const size_t kbase = hk * p.pk_head + (size_t)kg * p.pk_seq + col;
+          const uint4 kw = *reinterpret_cast<const device uint4*>(pk_w + kbase);
+          const size_t kgb =
+              hk * p.pks_head + (size_t)kg * p.pks_seq + (col >> 4);
+          const float ks = pk_s[kgb];
+          const float kb = pk_b[kgb];
+          const size_t vbase = hk * p.pv_head + (size_t)kg * p.pv_seq + col;
+          const uint4 vw = *reinterpret_cast<const device uint4*>(pv_w + vbase);
+          const size_t vgb =
+              hk * p.pvs_head + (size_t)kg * p.pvs_seq + (col >> 4);
+          const float vs_ = pv_s[vgb];
+          const float vb = pv_b[vgb];
+          STEEL_PRAGMA_UNROLL
+          for (short jj = 0; jj < kWordsPerVector; jj++) {
+            const uint32_t kwj = kw[jj];
+            const uint32_t vwj = vw[jj];
+            const int i = row * D4 + col + jj;
+            if constexpr (VectorByteUnpack) {
+              const float4 kc = float4(as_type<uchar4>(kwj));
+              const float4 vc = float4(as_type<uchar4>(vwj));
+              sK[i] = fma(float4(ks), kc, float4(kb));
+              sV[i] = fma(float4(vs_), vc, float4(vb));
+            } else {
+              sK[i] = float4(
+                  fma(ks, float(kwj & 0xff), kb),
+                  fma(ks, float((kwj >> 8) & 0xff), kb),
+                  fma(ks, float((kwj >> 16) & 0xff), kb),
+                  fma(ks, float((kwj >> 24) & 0xff), kb));
+              sV[i] = float4(
+                  fma(vs_, float(vwj & 0xff), vb),
+                  fma(vs_, float((vwj >> 8) & 0xff), vb),
+                  fma(vs_, float((vwj >> 16) & 0xff), vb),
+                  fma(vs_, float((vwj >> 24) & 0xff), vb));
+            }
+          }
+        } else {
+          STEEL_PRAGMA_UNROLL
+          for (short jj = 0; jj < kWordsPerVector; jj++) {
+            const int i = row * D4 + col + jj;
+            sK[i] = float4(0);
+            sV[i] = float4(0);
+          }
+        }
+      }
+    } else {
+      for (int i = flat; i < C * D4; i += n_threads) {
+        const int row = i / D4;
+        const int col = i % D4;
+        const int kg = kt + row;
+        if (kg < k1) {
+          const uint32_t kw =
+              pk_w[hk * p.pk_head + (size_t)kg * p.pk_seq + col];
+          const size_t kgb =
+              hk * p.pks_head + (size_t)kg * p.pks_seq + (col >> 4);
+          const float ks = pk_s[kgb];
+          const float kb = pk_b[kgb];
+          sK[i] = float4(
+              fma(ks, float(kw & 0xff), kb),
+              fma(ks, float((kw >> 8) & 0xff), kb),
+              fma(ks, float((kw >> 16) & 0xff), kb),
+              fma(ks, float((kw >> 24) & 0xff), kb));
+          const uint32_t vw =
+              pv_w[hk * p.pv_head + (size_t)kg * p.pv_seq + col];
+          const size_t vgb =
+              hk * p.pvs_head + (size_t)kg * p.pvs_seq + (col >> 4);
+          const float vs_ = pv_s[vgb];
+          const float vb = pv_b[vgb];
+          sV[i] = float4(
+              fma(vs_, float(vw & 0xff), vb),
+              fma(vs_, float((vw >> 8) & 0xff), vb),
+              fma(vs_, float((vw >> 16) & 0xff), vb),
+              fma(vs_, float((vw >> 24) & 0xff), vb));
+        } else {
+          sK[i] = float4(0);
+          sV[i] = float4(0);
+        }
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1744,4 +1804,64 @@ template <typename T, int D>
   for (short e = 0; e < EPT; e++) {
     out[e * 32 + simd_lid] = static_cast<T>(denom == 0 ? 0.0f : acc[e] / denom);
   }
+}
+
+// Fixed-geometry dimension-parallel form of the MLX-derived split merge above.
+// SIMD group zero preserves the shared merge's lane mapping and reduction order
+// for the global max, split weights, and denominator. The remaining SIMD groups
+// only redistribute output dimensions, and each dimension walks the splits in
+// the same increasing order as kq_sdpa_gqa_2pass_2.
+template <int SPLITS, int D, int DIM_SIMDS>
+[[kernel]] void kq_sdpa_q8_merge_dim_parallel(
+    const device float* partials [[buffer(0)]],
+    const device float* sums [[buffer(1)]],
+    const device float* maxs [[buffer(2)]],
+    const device float* sinks [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    const constant int& n_q_heads [[buffer(5)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]]) {
+  static_assert(SPLITS == 128, "dimension-parallel merge requires 128 splits");
+  static_assert(D == DIM_SIMDS * 32, "one SIMD group must cover 32 dimensions");
+
+  const int head_idx = tid.x;
+  const int batch_idx = tid.y;
+  const size_t base =
+      ((size_t)batch_idx * n_q_heads + head_idx) * tpg.z + tid.z;
+  partials += base * SPLITS * D;
+  sums += base * SPLITS;
+  maxs += base * SPLITS;
+  (void)sinks;
+
+  threadgroup float ws[SPLITS];
+  threadgroup float shared_denom;
+  if (simd_gid == 0) {
+    float m = Limits<float>::finite_min;
+    for (int s = simd_lid; s < SPLITS; s += 32) {
+      m = max(m, maxs[s]);
+    }
+    m = simd_max(m);
+
+    float denom = 0;
+    for (int s = simd_lid; s < SPLITS; s += 32) {
+      const float w = fast::exp(maxs[s] - m);
+      ws[s] = w;
+      denom += w * sums[s];
+    }
+    denom = simd_sum(denom);
+    if (simd_lid == 0) {
+      shared_denom = denom;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const int e = simd_gid;
+  float acc = 0;
+  for (int s = 0; s < SPLITS; s++) {
+    acc += ws[s] * partials[s * D + e * 32 + simd_lid];
+  }
+  out[base * D + e * 32 + simd_lid] =
+      shared_denom == 0 ? 0.0f : acc / shared_denom;
 }

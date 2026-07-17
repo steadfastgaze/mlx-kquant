@@ -52,6 +52,21 @@ NB_MODULE(_ext, m) {
       "Load the bundled metallib via the Metal device (toolchain self-check).");
 
   m.def(
+      "sdpa_q8_loader_debug",
+      [] {
+        const auto counts = mlx_kquant::sdpa_q8_loader_dispatch_counts();
+        nb::dict state;
+        state[nb::str("selected_arm")] =
+            nb::str(mlx_kquant::sdpa_q8_loader_arm().c_str());
+        state[nb::str("scalar_dynamic")] = nb::int_(counts.at(0));
+        state[nb::str("uint4_dynamic")] = nb::int_(counts.at(1));
+        state[nb::str("uint4_byte_dynamic")] = nb::int_(counts.at(2));
+        state[nb::str("off_contract")] = nb::int_(counts.at(3));
+        return state;
+      },
+      "Report the selected q8 loader arm and its process dispatch counters.");
+
+  m.def(
       "cpu_neon_available",
       &mlx_kquant::kq_cpu_neon_available,
       "True when the arm64 NEON int8 CPU GEMV kernels can run here (arm64 "
@@ -360,6 +375,7 @@ NB_MODULE(_ext, m) {
       "compute"_a = 1,
       "tile_c"_a = 0,
       nb::kw_only(),
+      "dimension_parallel_merge"_a = false,
       "stream"_a = nb::none(),
       R"(
         Fused q8 decode attention: the KV-attention read for one query row
@@ -387,6 +403,11 @@ NB_MODULE(_ext, m) {
                 reduction, the decode-latency form; 0 is the matrix-unit tile.
             tile_c (int): SIMD-shuffle staged tile height, 8 or 16; 0 the
                 default.
+            dimension_parallel_merge (bool): use the exact-order,
+                dimension-parallel split merge when the fixed 16:2,
+                split-128, tile-16 serving geometry is present at a cache
+                depth of at least 8192. Other geometries retain the shared
+                merge. Defaults to false.
 
         Returns:
             array: attention output [1, n_q_heads, 1, 256], float32.

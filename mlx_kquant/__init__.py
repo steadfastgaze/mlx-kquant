@@ -62,13 +62,17 @@ from ._ext import (  # noqa: F401
     sdpa_fa_prefill,
     sdpa_fa_prefill_q8,
     sdpa_fa_verify,
+    sdpa_q8_loader_debug,
     sdpa_vector,
     verify_zero_copy_views,
     zero_copy_view_count,
 )
 from ._version import __version__
 
+HAS_SDPA_DECODE_Q8_DIMENSION_PARALLEL_MERGE = True
+
 __all__ = [
+    "HAS_SDPA_DECODE_Q8_DIMENSION_PARALLEL_MERGE",
     "__version__",
     "add_rmsnorm",
     "codecs",
@@ -101,6 +105,7 @@ __all__ = [
     "sdpa_fa_prefill",
     "sdpa_fa_prefill_q8",
     "sdpa_fa_verify",
+    "sdpa_q8_loader_debug",
     "sdpa_vector",
     "verify_zero_copy_views",
     "zero_copy_view_count",

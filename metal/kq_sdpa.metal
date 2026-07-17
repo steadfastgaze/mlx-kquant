@@ -49,6 +49,11 @@ instantiate_kq_sdpa(float16_t, 512)
       type,                                                           \
       D)
 
+// Exact-order split-128 merge for the fixed 16-head, head-dim-256 q8 decode
+// geometry. Eight SIMD groups each own 32 output dimensions.
+instantiate_kernel(
+    "kq_sdpa_q8_merge_dim8", kq_sdpa_q8_merge_dim_parallel, 128, 256, 8)
+
 // Tile C is bounded by threadgroup memory (2 * C * D * sizeof(T4)/4 bytes;
 // 32 KB limit): D=64/128 stage 32 or 16 keys, D=256 stages 16 or 8.
 instantiate_kq_sdpa_gqa(bfloat16_t, 64, 32)
@@ -191,8 +196,11 @@ instantiate_kq_sdpa_decode_q8(float16_t, 256, 8)
 // staging, the whole q8 cache dequantized during the cooperative tile load, the
 // GQA group folded per threadgroup. C is the staged tile height (float4 staging
 // is 16 bytes per element, so C=8 stages 16 KB and C=16 stages 32 KB at D=256);
-// NE is the keys in flight per simdgroup. The merge reuses kq_sdpa_gqa_2pass_2
-// on the float output.
+// NE is the keys in flight per simdgroup. C=16 has a scalar control and an
+// aligned uint4 loaders; both retain the array-provided sequence strides. The
+// default aligned arm converts each packed word through uchar4 while the
+// control retains scalar byte extraction. The merge reuses
+// kq_sdpa_gqa_2pass_2 on the float output.
 #define instantiate_kq_sdpa_decode_gqa_q8(D, C, NE)                     \
   instantiate_kernel(                                                   \
       "kq_sdpa_decode_gqa_q8_2pass_1_" #D "_c" #C "_ne" #NE,           \
@@ -201,8 +209,25 @@ instantiate_kq_sdpa_decode_q8(float16_t, 256, 8)
       C,                                                                \
       NE)
 
+#define instantiate_kq_sdpa_decode_gqa_q8_loader(                       \
+    D, C, NE, uint4_load, vector_byte_unpack, suffix)                   \
+  instantiate_kernel(                                                   \
+      "kq_sdpa_decode_gqa_q8_2pass_1_" #D "_c" #C "_ne" #NE           \
+      "_" #suffix,                                                     \
+      kq_sdpa_decode_gqa_q8_2pass_1,                                    \
+      D,                                                                \
+      C,                                                                \
+      NE,                                                               \
+      uint4_load,                                                       \
+      vector_byte_unpack)
+
 instantiate_kq_sdpa_decode_gqa_q8(256, 8, 4)
-instantiate_kq_sdpa_decode_gqa_q8(256, 16, 4)
+instantiate_kq_sdpa_decode_gqa_q8_loader(
+    256, 16, 4, false, false, scalar_dynamic)
+instantiate_kq_sdpa_decode_gqa_q8_loader(
+    256, 16, 4, true, false, uint4_dynamic)
+instantiate_kq_sdpa_decode_gqa_q8_loader(
+    256, 16, 4, true, true, uint4_byte_dynamic)
 
 instantiate_kq_sdpa_gqa_merge(bfloat16_t, 64)
 instantiate_kq_sdpa_gqa_merge(float16_t, 64)
