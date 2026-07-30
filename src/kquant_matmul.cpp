@@ -862,4 +862,143 @@ void KQuantQmvBias::eval_gpu(
 
 #endif // _METAL_
 
+std::vector<mx::Shape> KQuantQmvHCPost::output_shapes(
+    const std::vector<mx::array>& inputs) {
+  return {inputs[3].shape()};
+}
+
+bool KQuantQmvHCPost::is_equivalent(const mx::Primitive&) const {
+  return true;
+}
+
+void KQuantQmvHCPost::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant] quantized_matmul_qmv_hc_post is Metal-only.");
+}
+
+#ifdef _METAL_
+
+void KQuantQmvHCPost::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  auto& out = outputs[0];
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+
+  const auto& x = inputs[0];
+  const auto& w = inputs[1];
+  const auto& scales = inputs[2];
+  const auto& residual = inputs[3];
+  const auto& post = inputs[4];
+  const auto& comb = inputs[5];
+
+  int K = x.shape(-1);
+  int N = w.shape(-2);
+  constexpr int qmv_rows_per_group = 8;
+  MTL::Size group_dims(32, 2, 1);
+  MTL::Size grid_dims(1, N / qmv_rows_per_group, 1);
+
+  std::string kname = "kquant_q8_0_qmv_fast_hc_post_";
+  kname += kq_type_string(x.dtype());
+  auto kernel = kq_get_kernel(d, kname);
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+
+  int c = 0;
+  ce.set_input_array(w, c++);
+  ce.set_input_array(scales, c++);
+  ce.set_input_array(x, c++);
+  ce.set_output_array(out, c++);
+  ce.set_input_array(residual, c++);
+  ce.set_input_array(post, c++);
+  ce.set_input_array(comb, c++);
+  ce.set_bytes(K, c++);
+  ce.set_bytes(N, c++);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+#else
+
+void KQuantQmvHCPost::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant] quantized_matmul_qmv_hc_post has no GPU implementation.");
+}
+
+#endif // _METAL_
+
+std::vector<mx::Shape> KQuantQmvAddHCPost::output_shapes(
+    const std::vector<mx::array>& inputs) {
+  return {inputs[4].shape()};
+}
+
+bool KQuantQmvAddHCPost::is_equivalent(const mx::Primitive&) const {
+  return true;
+}
+
+void KQuantQmvAddHCPost::eval_cpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant] quantized_matmul_qmv_add_hc_post is Metal-only.");
+}
+
+#ifdef _METAL_
+
+void KQuantQmvAddHCPost::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  auto& out = outputs[0];
+  out.set_data(mx::allocator::malloc(out.nbytes()));
+
+  const auto& x = inputs[0];
+  const auto& w = inputs[1];
+  const auto& scales = inputs[2];
+  const auto& routed = inputs[3];
+  const auto& residual = inputs[4];
+  const auto& post = inputs[5];
+  const auto& comb = inputs[6];
+
+  int K = x.shape(-1);
+  int N = w.shape(-2);
+  constexpr int qmv_rows_per_group = 8;
+  MTL::Size group_dims(32, 2, 1);
+  MTL::Size grid_dims(1, N / qmv_rows_per_group, 1);
+
+  auto kernel = kq_get_kernel(d, "kquant_q8_0_qmv_fast_add_hc_post_bfloat16_t");
+  auto& ce = mx::metal::get_command_encoder(s);
+  ce.set_compute_pipeline_state(kernel);
+
+  int c = 0;
+  ce.set_input_array(w, c++);
+  ce.set_input_array(scales, c++);
+  ce.set_input_array(x, c++);
+  ce.set_output_array(out, c++);
+  ce.set_input_array(routed, c++);
+  ce.set_input_array(residual, c++);
+  ce.set_input_array(post, c++);
+  ce.set_input_array(comb, c++);
+  ce.set_bytes(K, c++);
+  ce.set_bytes(N, c++);
+  ce.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+#else
+
+void KQuantQmvAddHCPost::eval_gpu(
+    const std::vector<mx::array>&,
+    std::vector<mx::array>&) {
+  throw std::runtime_error(
+      "[mlx_kquant] quantized_matmul_qmv_add_hc_post has no GPU "
+      "implementation.");
+}
+
+#endif // _METAL_
+
 } // namespace mlx_kquant

@@ -155,6 +155,69 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "quantized_matmul_qmv_hc_post",
+      &mlx_kquant::quantized_matmul_qmv_hc_post,
+      "x"_a,
+      "w"_a,
+      "scales"_a,
+      "residual"_a,
+      "post"_a,
+      "comb"_a,
+      "kquant_type"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Decode-only Q8_0 matvec with the DeepSeek-V4 hyper-connection post
+        recombination fused into the QMV epilogue.
+
+        The supported shape is one float32 or bfloat16 activation row ``[K]``,
+        Q8_0 wire weights ``[N, K]``, float32 residual channels ``[4, N]``,
+        float32 post gates ``[4]``, and a float32 combination matrix
+        ``[4, 4]``. ``K`` must be divisible by 256 and ``N`` by 8.
+        ``scales`` is the standard vestigial K-quant placeholder and is
+        ignored by the kernel.
+
+        Float32 activations are rounded to bfloat16 inside the QMV. The QMV
+        result is also rounded to bfloat16 before the float32 hC-post formula,
+        matching a stock ``quantized_matmul`` followed by the served DS4
+        recombination. The op is Metal-only.
+
+        Returns:
+            array: float32 ``[4, N]`` recombined hyper-connection streams.
+      )");
+
+  m.def(
+      "quantized_matmul_qmv_add_hc_post",
+      &mlx_kquant::quantized_matmul_qmv_add_hc_post,
+      "x"_a,
+      "w"_a,
+      "scales"_a,
+      "routed"_a,
+      "residual"_a,
+      "post"_a,
+      "comb"_a,
+      "kquant_type"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Fixed-geometry decode-only Q8_0 shared-FFN matvec with the routed
+        result add and DeepSeek-V4 hyper-connection post recombination fused
+        into the QMV epilogue.
+
+        The supported shape is one bfloat16 activation row of length 2048,
+        Q8_0 wire weights ``[4096, 2176]``, a float16 routed result ``[4096]``,
+        float32 residual channels ``[4, 4096]``, float32 post gates ``[4]``,
+        and a float32 combination matrix ``[4, 4]``.
+
+        The QMV result is rounded to bfloat16, widened to float32, and added to
+        the widened routed value before the exact float32 hC-post formula.
+        The op is Metal-only.
+
+        Returns:
+            array: float32 ``[4, 4096]`` recombined hyper-connection streams.
+      )");
+
+  m.def(
       "sdpa_vector",
       &mlx_kquant::sdpa_vector,
       "q"_a,

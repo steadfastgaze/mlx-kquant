@@ -10,6 +10,10 @@ Current API:
   * ``quantized_matmul`` - x @ dequant(w) for K-quant weights.
   * ``quantized_matmul_qmv_bias`` - decode-only (M=1) bias-fused variant of
     ``quantized_matmul``, q8_0 only.
+  * ``quantized_matmul_qmv_hc_post`` - decode-only Q8_0 matvec with the
+    DeepSeek-V4 hyper-connection post recombination fused into its epilogue.
+  * ``quantized_matmul_qmv_add_hc_post`` - fixed-geometry shared-FFN Q8_0
+    matvec with routed-add and DeepSeek-V4 hC-post fused into its epilogue.
   * ``gather_qmm`` - mixture-of-experts gathered quantized matmul.
   * ``gather_qmm_segments`` - descriptor-driven segmented MoE quantized GEMM.
   * ``gather_qmm_sorted`` - segmented MoE quantized GEMM over device-sorted
@@ -54,7 +58,9 @@ from ._ext import (  # noqa: F401
     moe_router_topk,
     quantize,
     quantized_matmul,
+    quantized_matmul_qmv_add_hc_post,
     quantized_matmul_qmv_bias,
+    quantized_matmul_qmv_hc_post,
     rmsnorm2_add,
     rmsnorm_multi3,
     sdpa_decode_gqa,
@@ -97,7 +103,9 @@ __all__ = [
     "moe_router_topk",
     "quantize",
     "quantized_matmul",
+    "quantized_matmul_qmv_add_hc_post",
     "quantized_matmul_qmv_bias",
+    "quantized_matmul_qmv_hc_post",
     "rmsnorm2_add",
     "rmsnorm_multi3",
     "sdpa_decode_gqa",

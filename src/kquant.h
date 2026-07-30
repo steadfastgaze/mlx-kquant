@@ -80,6 +80,53 @@ mx::array quantized_matmul_qmv_bias(
     const std::string& kquant_type,
     mx::StreamOrDevice s = {});
 
+// Decode-only Q8_0 matvec with the DeepSeek-V4 hyper-connection post
+// recombination fused into the QMV epilogue. The supported contract is:
+//   x: float32 or bfloat16 with exactly one [K] row
+//   w: uint8 Q8_0 wire bytes [N, K], with K % 256 == 0 and N % 8 == 0
+//   scales: vestigial placeholder, ignored by the kernel
+//   residual: float32 [4, N]
+//   post: float32 [4]
+//   comb: float32 [4, 4]
+// Float32 x values are rounded to bfloat16 inside the QMV; bfloat16 x values
+// are consumed directly. The QMV scalar is rounded to bfloat16 before widening
+// to float32. The returned float32 [4, N] is
+// post[:, None] * qmv[None, :] + comb.T @ residual, matching the DS4 decode
+// graph's quantized-matmul and float32 hC-post rounding boundaries. Metal-only;
+// the CPU evaluation path throws.
+mx::array quantized_matmul_qmv_hc_post(
+    mx::array x,
+    mx::array w,
+    mx::array scales,
+    mx::array residual,
+    mx::array post,
+    mx::array comb,
+    const std::string& kquant_type,
+    mx::StreamOrDevice s = {});
+
+// Fixed-geometry decode-only Q8_0 matvec for the DeepSeek-V4 shared FFN
+// projection, with the routed FFN result and hC-post recombination fused into
+// the QMV epilogue. The supported contract is:
+//   x: bfloat16 with exactly one row of length 2048
+//   w: uint8 Q8_0 wire bytes [4096, 2176]
+//   routed: float16 [4096]
+//   residual: float32 [4, 4096]
+//   post: float32 [4]
+//   comb: float32 [4, 4]
+// The QMV scalar is rounded to bfloat16, widened to float32, and added to the
+// widened routed value before the exact float32 hC-post formula. The returned
+// shape is float32 [4, 4096]. Metal-only; the CPU evaluation path throws.
+mx::array quantized_matmul_qmv_add_hc_post(
+    mx::array x,
+    mx::array w,
+    mx::array scales,
+    mx::array routed,
+    mx::array residual,
+    mx::array post,
+    mx::array comb,
+    const std::string& kquant_type,
+    mx::StreamOrDevice s = {});
+
 // Gather (mixture-of-experts) quantized matmul: for each output row, select an
 // expert weight matrix via `rhs_indices` and an x row via `lhs_indices`, then
 // matmul. `w` is uint8 K-quant wire bytes shaped (n_experts, N, bytes_per_row);
@@ -643,6 +690,52 @@ class KQuantQmvBias : public mx::Primitive {
   std::string kquant_type_;
   int group_size_;
   int bits_;
+};
+
+// Decode-only Q8_0 QMV with the DS4 float32 hC-post epilogue. Inference-only:
+// no transform overrides. The op-level API enforces the complete aligned shape
+// and dtype contract before this primitive is constructed.
+class KQuantQmvHCPost : public mx::Primitive {
+ public:
+  explicit KQuantQmvHCPost(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantQmvHCPost";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+};
+
+// Fixed-geometry decode-only Q8_0 shared-FFN QMV with routed-add and DS4
+// float32 hC-post epilogues. Inference-only; the public op validates the full
+// served shape and dtype contract before constructing this primitive.
+class KQuantQmvAddHCPost : public mx::Primitive {
+ public:
+  explicit KQuantQmvAddHCPost(mx::Stream stream) : mx::Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+
+  const char* name() const override {
+    return "KQuantQmvAddHCPost";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
 };
 
 // Vector SDPA for large head dims. Inference-only: jvp/vjp/vmap inherit the

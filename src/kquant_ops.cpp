@@ -262,6 +262,186 @@ mx::array quantized_matmul_qmv_bias(
       {x_c, w_c, scales_c, bias_c});
 }
 
+mx::array quantized_matmul_qmv_hc_post(
+    mx::array x,
+    mx::array w,
+    mx::array scales,
+    mx::array residual,
+    mx::array post,
+    mx::array comb,
+    const std::string& kquant_type,
+    mx::StreamOrDevice s_) {
+  constexpr int hc = 4;
+  constexpr int qmv_n_align = 8;
+  constexpr int qmv_k_align = 256;
+
+  if (kquant_type != "q8_0") {
+    throw std::invalid_argument(
+        "[mlx_kquant.quantized_matmul_qmv_hc_post] only kquant_type 'q8_0' "
+        "is supported, got '" +
+        kquant_type + "'.");
+  }
+  if ((x.dtype() != mx::float32 && x.dtype() != mx::bfloat16) || x.ndim() < 1) {
+    throw std::invalid_argument(
+        "[mlx_kquant.quantized_matmul_qmv_hc_post] x must be float32 or "
+        "bfloat16 with at least one dimension.");
+  }
+  if (w.dtype() != mx::uint8 || w.ndim() != 2) {
+    throw std::invalid_argument(
+        "[mlx_kquant.quantized_matmul_qmv_hc_post] w must be a 2D uint8 "
+        "Q8_0 wire matrix.");
+  }
+
+  const KQuantCodec* codec = codec_by_name(kquant_type);
+  int w_bytes_per_row = w.shape(-1);
+  if (w_bytes_per_row == 0 || w_bytes_per_row % codec->bytes_per_block != 0) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.quantized_matmul_qmv_hc_post] w last dim ("
+        << w_bytes_per_row << ") must be a positive multiple of "
+        << codec->bytes_per_block << " Q8_0 bytes.";
+    throw std::invalid_argument(msg.str());
+  }
+  int K = (w_bytes_per_row / codec->bytes_per_block) * codec->weights_per_block;
+  int N = w.shape(-2);
+  if (N <= 0 || N % qmv_n_align != 0 || K % qmv_k_align != 0) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.quantized_matmul_qmv_hc_post] fast-QMV alignment "
+        << "requires positive N divisible by " << qmv_n_align
+        << " and K divisible by " << qmv_k_align << "; got N=" << N
+        << ", K=" << K << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (x.shape(-1) != K || static_cast<int64_t>(x.size()) / x.shape(-1) != 1) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.quantized_matmul_qmv_hc_post] decode-only x must "
+        << "contain exactly one row of length " << K << "; got shape "
+        << x.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (residual.dtype() != mx::float32 || residual.shape() != mx::Shape{hc, N}) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.quantized_matmul_qmv_hc_post] residual must be "
+        << "float32 [4, " << N << "], got dtype " << residual.dtype()
+        << " and shape " << residual.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (post.dtype() != mx::float32 || post.shape() != mx::Shape{hc}) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.quantized_matmul_qmv_hc_post] post must be float32 "
+        << "[4], got dtype " << post.dtype() << " and shape " << post.shape()
+        << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (comb.dtype() != mx::float32 || comb.shape() != mx::Shape{hc, hc}) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.quantized_matmul_qmv_hc_post] comb must be float32 "
+        << "[4, 4], got dtype " << comb.dtype() << " and shape " << comb.shape()
+        << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto s = mx::to_stream(s_);
+  auto x_c = kq_ensure_row_contiguous_matrix(x, s);
+  auto w_c = kq_ensure_row_contiguous_matrix(w, s);
+  auto scales_c =
+      scales.flags().row_contiguous ? scales : mx::contiguous(scales, false, s);
+  auto residual_c = kq_ensure_row_contiguous_matrix(residual, s);
+  auto post_c =
+      post.flags().row_contiguous ? post : mx::contiguous(post, false, s);
+  auto comb_c = kq_ensure_row_contiguous_matrix(comb, s);
+
+  return mx::array(
+      {hc, N},
+      mx::float32,
+      std::make_shared<KQuantQmvHCPost>(s),
+      {x_c, w_c, scales_c, residual_c, post_c, comb_c});
+}
+
+mx::array quantized_matmul_qmv_add_hc_post(
+    mx::array x,
+    mx::array w,
+    mx::array scales,
+    mx::array routed,
+    mx::array residual,
+    mx::array post,
+    mx::array comb,
+    const std::string& kquant_type,
+    mx::StreamOrDevice s_) {
+  constexpr int hc = 4;
+  constexpr int K = 2048;
+  constexpr int N = 4096;
+  constexpr int w_bytes_per_row = 2176;
+
+  if (kquant_type != "q8_0") {
+    throw std::invalid_argument(
+        "[mlx_kquant.quantized_matmul_qmv_add_hc_post] only kquant_type "
+        "'q8_0' is supported, got '" +
+        kquant_type + "'.");
+  }
+  if (x.dtype() != mx::bfloat16 || x.ndim() < 1 || x.shape(-1) != K ||
+      static_cast<int64_t>(x.size()) / K != 1) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.quantized_matmul_qmv_add_hc_post] x must be "
+        << "bfloat16 with exactly one row of length " << K << "; got dtype "
+        << x.dtype() << " and shape " << x.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (w.dtype() != mx::uint8 || w.shape() != mx::Shape{N, w_bytes_per_row}) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.quantized_matmul_qmv_add_hc_post] w must be uint8 "
+        << "[" << N << ", " << w_bytes_per_row
+        << "] Q8_0 wire bytes; got dtype " << w.dtype() << " and shape "
+        << w.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (routed.dtype() != mx::float16 || routed.shape() != mx::Shape{N}) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.quantized_matmul_qmv_add_hc_post] routed must be "
+        << "float16 [" << N << "], got dtype " << routed.dtype()
+        << " and shape " << routed.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (residual.dtype() != mx::float32 || residual.shape() != mx::Shape{hc, N}) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.quantized_matmul_qmv_add_hc_post] residual must be "
+        << "float32 [4, " << N << "], got dtype " << residual.dtype()
+        << " and shape " << residual.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (post.dtype() != mx::float32 || post.shape() != mx::Shape{hc}) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.quantized_matmul_qmv_add_hc_post] post must be "
+        << "float32 [4], got dtype " << post.dtype() << " and shape "
+        << post.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (comb.dtype() != mx::float32 || comb.shape() != mx::Shape{hc, hc}) {
+    std::ostringstream msg;
+    msg << "[mlx_kquant.quantized_matmul_qmv_add_hc_post] comb must be "
+        << "float32 [4, 4], got dtype " << comb.dtype() << " and shape "
+        << comb.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto s = mx::to_stream(s_);
+  auto x_c = kq_ensure_row_contiguous_matrix(x, s);
+  auto w_c = kq_ensure_row_contiguous_matrix(w, s);
+  auto scales_c =
+      scales.flags().row_contiguous ? scales : mx::contiguous(scales, false, s);
+  auto routed_c =
+      routed.flags().row_contiguous ? routed : mx::contiguous(routed, false, s);
+  auto residual_c = kq_ensure_row_contiguous_matrix(residual, s);
+  auto post_c =
+      post.flags().row_contiguous ? post : mx::contiguous(post, false, s);
+  auto comb_c = kq_ensure_row_contiguous_matrix(comb, s);
+
+  return mx::array(
+      {hc, N},
+      mx::float32,
+      std::make_shared<KQuantQmvAddHCPost>(s),
+      {x_c, w_c, scales_c, routed_c, residual_c, post_c, comb_c});
+}
+
 namespace {
 
 // When indices are omitted, default to a flat arange over the leading (batch)

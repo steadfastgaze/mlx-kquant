@@ -181,6 +181,7 @@ if(MLX_BUILD_METAL)
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_norm_fused.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_segments.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_decode_moe.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_ds4_hc_post.metal
     INCLUDE_DIRS
     ${CMAKE_CURRENT_LIST_DIR}/metal
     ${MLX_INCLUDE_DIRS}
