@@ -6,6 +6,29 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- `quantized_matmul` returned wrong values when an unevaluated (lazy)
+  row-strided activation view - for example a grouped tensor sliced on the
+  second-to-last axis - met any multi-row shape (M >= 2) at a half-precision
+  dtype. The op-level matrix-contiguity check runs at graph construction,
+  where an unevaluated array still carries the constructor's dense
+  placeholder strides and default-true contiguity flags, so the strided view
+  passed unconverted and the kernels, which advance the M rows densely by K
+  after the batch offset, read the wrong elements (measured rel error
+  ~0.5-1.8 against the contiguized reference on every codec and both weight
+  forms; float32 activations were laundered dense by the op's astype;
+  single-row calls have no row stride to misread; a pre-evaluated strided
+  view was contiguized correctly, which made the failure depend on
+  evaluation batching). The op now contiguizes unevaluated multi-row
+  activations lazy-safely (`mx::contiguous` evaluates to a zero-cost
+  shared-buffer pass-through when the materialized layout is already
+  row-contiguous, so dense lazy activations gain no copy, and single-row
+  decode calls keep the node-free path), and `KQuantMatmul` eval fails
+  closed with a clear error on any operand that still arrives without
+  densely packed rows instead of computing garbage. Outputs on every
+  previously correct operand set are bit-identical; the previously wrong
+  sets now match the contiguized-reference call bit-exactly.
+
 ### Added
 - `sdpa_decode_q8(..., dimension_parallel_merge=True)` adds an opt-in
   dimension-parallel pass-two kernel for the 16-query-head, 2-KV-head,

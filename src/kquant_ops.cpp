@@ -29,6 +29,13 @@ namespace {
 // (leading) stride is 2*H rows: matrix-contiguous but NOT row_contiguous, so
 // full contiguify copies ~142 MB PER gather call (the decode MoE 5x
 // regression).
+//
+// Limitation: this check runs at graph construction. An unevaluated array
+// still carries the constructor's dense placeholder strides and default-true
+// contiguity flags (the real layout exists only after evaluation), so a lazy
+// strided view passes the check unconverted. This helper is therefore a
+// cheap fast path, not a guarantee; a primitive whose kernels require dense
+// rows must re-check the evaluated metadata in eval (KQuantMatmul does).
 inline mx::array kq_ensure_row_contiguous_matrix(
     const mx::array& x,
     mx::StreamOrDevice s) {
@@ -42,6 +49,40 @@ inline mx::array kq_ensure_row_contiguous_matrix(
     if (stride_0 == static_cast<int64_t>(x.shape(-1)) && stride_1 == 1) {
       return x;
     }
+  }
+  return mx::contiguous(x, false, s);
+}
+
+// Activation-side density guard for quantized_matmul. Strides and contiguity
+// flags are real only once an array's eval has run (status != unscheduled);
+// an unscheduled array still carries the constructor's dense placeholder
+// metadata, so a lazy strided view sails through the matrix-contiguity check
+// above unconverted, and the matmul kernels - which advance the M rows
+// densely by K after the batch offset - then read the wrong elements on
+// every multi-row call. That is the DS4 grouped-projection defect: a grouped
+// activation's second-to-last-axis slice at M >= 2 measured rel error
+// ~0.5-1.8 against the contiguized reference on every codec and both weight
+// forms; float32 activations were laundered dense by the op's astype, and
+// single-row calls have no row stride to misread, which is why decode text
+// stayed coherent while every multi-row scorer read garbage.
+//
+// For an unscheduled multi-row activation, insert mx::contiguous: its eval
+// is a zero-cost shared-buffer pass-through when the materialized layout is
+// already row-contiguous and a real copy otherwise. Single-row activations
+// pass through untouched - the row stride is never read at M = 1, and the
+// inserted node would land on the decode hot path of every consumer.
+inline mx::array kq_ensure_dense_rows_lazy_safe(
+    const mx::array& x,
+    mx::StreamOrDevice s) {
+  if (x.status() != mx::array::Status::unscheduled) {
+    return kq_ensure_row_contiguous_matrix(x, s);
+  }
+  int64_t rows = 1;
+  for (int i = 0; i + 1 < static_cast<int>(x.ndim()); ++i) {
+    rows *= x.shape(i);
+  }
+  if (rows <= 1) {
+    return x;
   }
   return mx::contiguous(x, false, s);
 }
@@ -158,9 +199,14 @@ mx::array quantized_matmul(
 
   auto s = mx::to_stream(s_);
 
-  // Cast x to the output dtype, then matrix-row-contiguize x / w / scales at
-  // the op level so eval_gpu can assume dense inputs.
-  auto x_c = kq_ensure_row_contiguous_matrix(mx::astype(x, out_type, s), s);
+  // Cast x to the output dtype, then contiguize at the op level. The
+  // activation takes the lazy-safe form (a lazy strided view carries dense
+  // placeholder metadata that defeats the plain check); w and scales keep
+  // the metadata check - the wire is evaluated in every real flow, and a
+  // fresh row-slice of it materializes as a dense-rows offset view that the
+  // kernels address correctly. KQuantMatmul::eval fails closed on anything
+  // that still arrives without densely packed rows.
+  auto x_c = kq_ensure_dense_rows_lazy_safe(mx::astype(x, out_type, s), s);
   auto w_c = kq_ensure_row_contiguous_matrix(w, s);
   auto scales_c = kq_ensure_row_contiguous_matrix(scales, s);
 

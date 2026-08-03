@@ -1,7 +1,12 @@
 // KQuantMatmul primitive: x @ dequant(w). The GPU path dispatches the leaf
 // kernels (qmm / qmm_nax / qvm / qmv) from the bundled metallib via
-// d.get_kernel(name, lib); the op guarantees row-contiguity before dispatch and
-// kernel-name type tokens come from kq_type_string. NAX (tensor-core)
+// d.get_kernel(name, lib). The leaf kernels walk leading (batch) dims through
+// dispatched strides but advance the M rows densely by K, so the op
+// contiguizes the activation lazy-safely at construction and eval fails
+// closed on any operand that still reaches it without densely packed rows
+// (a plain metadata check at graph construction cannot see the layout of an
+// unevaluated strided view: it still carries dense placeholder strides).
+// Kernel-name type tokens come from kq_type_string. NAX (tensor-core)
 // availability is probed via kq_is_nax_available. The split-k paths
 // (qmm_splitk / qvm_split_k) are omitted - plain qmm/qvm produce identical
 // results with less parallelism. KQuantMatmul itself never carries a bias (a
@@ -34,6 +39,45 @@
 namespace mx = mlx::core;
 
 namespace mlx_kquant {
+
+namespace {
+
+// Dense-rows check on evaluated metadata. The op-level contiguity check
+// (kq_ensure_row_contiguous_matrix) runs at graph construction, where an
+// unevaluated array still carries the constructor's dense placeholder strides
+// and default-true contiguity flags - the real layout exists only after
+// evaluation - so on its own it cannot guarantee the layout the kernels
+// need. The matmul kernels walk leading (batch) dims through the strides
+// passed at dispatch but advance the M rows densely by K, so the last two
+// dims must be packed. A single row only needs a unit last-dim stride: its
+// row stride is never read. quantized_matmul() closes the activation-side
+// hole with a lazy-safe contiguation; this check runs at eval, where the
+// metadata is real, and fails closed rather than let a non-dense operand
+// reach a kernel that would silently read the wrong elements.
+inline bool kq_matrix_rows_dense(const mx::array& a) {
+  if (a.ndim() == 0) {
+    return true;
+  }
+  if (a.strides()[a.ndim() - 1] != 1) {
+    return false;
+  }
+  if (a.ndim() < 2 || a.shape(-2) == 1) {
+    return true;
+  }
+  return a.strides()[a.ndim() - 2] == static_cast<int64_t>(a.shape(-1));
+}
+
+void kq_require_dense_rows(const mx::array& a, const char* which) {
+  if (!kq_matrix_rows_dense(a)) {
+    throw std::runtime_error(
+        std::string("[mlx_kquant] quantized_matmul: ") + which +
+        " reached eval without densely packed rows (row stride != row "
+        "length). The kernels advance rows densely, so this operand would "
+        "be read incorrectly; pass it through mx.contiguous() first.");
+  }
+}
+
+} // namespace
 
 #ifdef _METAL_
 
@@ -512,11 +556,15 @@ bool KQuantMatmul::is_equivalent(const mx::Primitive& other) const {
 void KQuantMatmul::eval_cpu(
     const std::vector<mx::array>& inputs,
     std::vector<mx::array>& outputs) {
-  // inputs: x, w (uint8), scales placeholder (ignored). Matrix-contiguous by
-  // the op, so the M x K / weight rows are dense; leading (batch) dims are
-  // walked via elem_to_loc.
+  // inputs: x, w (uint8), scales placeholder (ignored). The kernel below
+  // requires dense M x K / weight rows; leading (batch) dims are walked via
+  // elem_to_loc. The op contiguizes the activation lazy-safely; this check
+  // runs on the evaluated metadata and fails closed on any operand the
+  // kernel would read incorrectly.
   const auto& x = inputs[0];
   const auto& w = inputs[1];
+  kq_require_dense_rows(x, "x");
+  kq_require_dense_rows(w, "w");
   auto& out = outputs[0];
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
@@ -612,10 +660,18 @@ void KQuantMatmul::eval_gpu(
   auto& out = outputs[0];
   out.set_data(mx::allocator::malloc(out.nbytes()));
 
-  // inputs are row-contiguous (ensured by the op): x, w (uint8), scales.
+  // x, w (uint8), scales. The op casts and contiguizes at graph
+  // construction (lazy-safely for the activation); this check runs on the
+  // evaluated metadata, where a strided layout is actually visible, and
+  // fails closed rather than let the leaf kernels - which advance the M
+  // rows densely by K after the batch offset - silently read the wrong
+  // elements. Dense inputs pass through untouched, so dispatch and output
+  // are bit-identical for every operand set the kernels already handled.
   const auto& x = inputs[0];
   const auto& w = inputs[1];
   const auto& scales = inputs[2];
+  kq_require_dense_rows(x, "x");
+  kq_require_dense_rows(w, "w");
 
   bool non_batched = w.ndim() == 2 && x.flags().row_contiguous;
   int K = x.shape(-1);
