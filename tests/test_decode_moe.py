@@ -69,7 +69,8 @@ def pair_experts():
         wq_np = np.ascontiguousarray(np.array(wq).astype(np.uint8))
         wq_list.append(wq_np)
         deq_list.append(
-            np.array(kq.dequantize(mx.array(wq_np), scales, "iq2_xxs", mx.float32)))
+            np.array(kq.dequantize(mx.array(wq_np), scales, "iq2_xxs", mx.float32))
+        )
     return mx.array(np.stack(wq_list)), deq_list
 
 
@@ -88,7 +89,8 @@ def down_experts():
         wq_np = np.ascontiguousarray(np.array(wq).astype(np.uint8))
         wq_list.append(wq_np)
         deq_list.append(
-            np.array(kq.dequantize(mx.array(wq_np), scales, "q2_k", mx.float32)))
+            np.array(kq.dequantize(mx.array(wq_np), scales, "q2_k", mx.float32))
+        )
     return mx.array(np.stack(wq_list)), deq_list
 
 
@@ -130,15 +132,15 @@ def test_pair_swiglu_matches_dq_reference(pair_experts, case, dtype):
     gate = np.stack([deq[e][:GATE_OUT].astype(np.float64) @ x_ref for e in ids_np])
     up = np.stack([deq[e][GATE_OUT:].astype(np.float64) @ x_ref for e in ids_np])
     clips = bool(
-        (gate > SWIGLU_LIMIT_ACTIVE).any()
-        or (np.abs(up) > SWIGLU_LIMIT_ACTIVE).any())
+        (gate > SWIGLU_LIMIT_ACTIVE).any() or (np.abs(up) > SWIGLU_LIMIT_ACTIVE).any()
+    )
     assert clips, f"{case}: active limit would clip nothing"
 
     rtol, atol = PAIR_TOLS[dtype]
     for limit in (SWIGLU_LIMIT_ACTIVE, SWIGLU_LIMIT_OFF):
         got = kq.gather_qmv_pair_swiglu(
-            x, w, scales, "iq2_xxs", mx.array(ids_np), mx.array(rw_np),
-            GATE_OUT, limit)
+            x, w, scales, "iq2_xxs", mx.array(ids_np), mx.array(rw_np), GATE_OUT, limit
+        )
         mx.eval(got)
         assert got.dtype == dtype
         assert got.shape == (B, GATE_OUT)
@@ -167,28 +169,40 @@ def test_pair_swiglu_matches_unfused_composition(pair_experts):
     x = mx.array(x_np)
 
     got = kq.gather_qmv_pair_swiglu(
-        x, w, scales, "iq2_xxs", mx.array(ids_np), mx.array(rw_np),
-        GATE_OUT, SWIGLU_LIMIT_ACTIVE)
+        x,
+        w,
+        scales,
+        "iq2_xxs",
+        mx.array(ids_np),
+        mx.array(rw_np),
+        GATE_OUT,
+        SWIGLU_LIMIT_ACTIVE,
+    )
     mx.eval(got)
 
     comb = kq.gather_qmm(
         mx.broadcast_to(x[None, None], (B, 1, 1, K)),
-        w, scales, "iq2_xxs",
+        w,
+        scales,
+        "iq2_xxs",
         rhs_indices=mx.array(ids_np).reshape(B, 1),
         transpose=True,
     )
     mx.eval(comb)
-    comb = np.array(
-        comb.astype(mx.float32), dtype=np.float64).reshape(B, 2 * GATE_OUT)
+    comb = np.array(comb.astype(mx.float32), dtype=np.float64).reshape(B, 2 * GATE_OUT)
     ref = _swiglu_rows(
-        comb[:, :GATE_OUT], comb[:, GATE_OUT:], SWIGLU_LIMIT_ACTIVE,
-        rw_np.astype(np.float64))
+        comb[:, :GATE_OUT],
+        comb[:, GATE_OUT:],
+        SWIGLU_LIMIT_ACTIVE,
+        rw_np.astype(np.float64),
+    )
 
     # gather_qmm promotes float32 x to bfloat16 output, so the composition
     # itself carries bfloat16 rounding; the bound reflects that, not the
     # fused kernel (which the dq reference test pins tightly).
     np.testing.assert_allclose(
-        np.array(got, dtype=np.float64), ref, rtol=5e-2, atol=1e-2)
+        np.array(got, dtype=np.float64), ref, rtol=5e-2, atol=1e-2
+    )
 
 
 def test_pair_swiglu_deep_negative_gate_is_zero():
@@ -208,8 +222,7 @@ def test_pair_swiglu_deep_negative_gate_is_zero():
     wq, _ = kq.quantize(mx.array(w_np), "iq2_xxs", imatrix=imat)
     mx.eval(wq)
     wq_np = np.ascontiguousarray(np.array(wq).astype(np.uint8))
-    deq = np.array(
-        kq.dequantize(mx.array(wq_np), scales, "iq2_xxs", mx.float32))
+    deq = np.array(kq.dequantize(mx.array(wq_np), scales, "iq2_xxs", mx.float32))
 
     x_np = (np.abs(rng.standard_normal((1, K))) * 0.5 + 0.25).astype(np.float32)
     x64 = x_np.astype(np.float64).reshape(K)
@@ -224,8 +237,15 @@ def test_pair_swiglu_deep_negative_gate_is_zero():
     for dtype in (mx.float16, mx.bfloat16, mx.float32):
         for limit in (0.0, SWIGLU_LIMIT_OFF):
             got = kq.gather_qmv_pair_swiglu(
-                mx.array(x_np).astype(dtype), w, scales, "iq2_xxs", ids, rw,
-                GATE_OUT, limit)
+                mx.array(x_np).astype(dtype),
+                w,
+                scales,
+                "iq2_xxs",
+                ids,
+                rw,
+                GATE_OUT,
+                limit,
+            )
             mx.eval(got)
             out = np.array(got.astype(mx.float32))
             assert not np.isnan(out).any(), f"{dtype} limit={limit}: NaN"
@@ -242,31 +262,57 @@ def test_pair_swiglu_rejects_bad_inputs(pair_experts):
     rw = mx.array(np.ones(6, dtype=np.float32))
 
     with pytest.raises(ValueError, match="no pair"):
-        kq.gather_qmv_pair_swiglu(
-            x, w, scales, "q2_k", ids, rw, GATE_OUT, 0.2)
+        kq.gather_qmv_pair_swiglu(x, w, scales, "q2_k", ids, rw, GATE_OUT, 0.2)
     with pytest.raises(ValueError):
         kq.gather_qmv_pair_swiglu(
-            x, w, scales, "iq2_xxs",
-            mx.array(np.zeros(6, dtype=np.int32)), rw, GATE_OUT, 0.2)
+            x,
+            w,
+            scales,
+            "iq2_xxs",
+            mx.array(np.zeros(6, dtype=np.int32)),
+            rw,
+            GATE_OUT,
+            0.2,
+        )
     with pytest.raises(ValueError):
         kq.gather_qmv_pair_swiglu(
-            x, w, scales, "iq2_xxs", ids,
-            mx.array(np.ones(4, dtype=np.float32)), GATE_OUT, 0.2)
+            x,
+            w,
+            scales,
+            "iq2_xxs",
+            ids,
+            mx.array(np.ones(4, dtype=np.float32)),
+            GATE_OUT,
+            0.2,
+        )
     with pytest.raises(ValueError):
         kq.gather_qmv_pair_swiglu(
-            x, w, scales, "iq2_xxs", ids,
-            rw.astype(mx.float16), GATE_OUT, 0.2)
+            x, w, scales, "iq2_xxs", ids, rw.astype(mx.float16), GATE_OUT, 0.2
+        )
+    with pytest.raises(ValueError):
+        kq.gather_qmv_pair_swiglu(x, w, scales, "iq2_xxs", ids, rw, GATE_OUT // 2, 0.2)
     with pytest.raises(ValueError):
         kq.gather_qmv_pair_swiglu(
-            x, w, scales, "iq2_xxs", ids, rw, GATE_OUT // 2, 0.2)
+            mx.zeros((2, K), dtype=mx.float32),
+            w,
+            scales,
+            "iq2_xxs",
+            ids,
+            rw,
+            GATE_OUT,
+            0.2,
+        )
     with pytest.raises(ValueError):
         kq.gather_qmv_pair_swiglu(
-            mx.zeros((2, K), dtype=mx.float32), w, scales, "iq2_xxs", ids,
-            rw, GATE_OUT, 0.2)
-    with pytest.raises(ValueError):
-        kq.gather_qmv_pair_swiglu(
-            mx.zeros((1, K // 2), dtype=mx.float32), w, scales, "iq2_xxs",
-            ids, rw, GATE_OUT, 0.2)
+            mx.zeros((1, K // 2), dtype=mx.float32),
+            w,
+            scales,
+            "iq2_xxs",
+            ids,
+            rw,
+            GATE_OUT,
+            0.2,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -324,19 +370,25 @@ def test_expert_sum_matches_unfused_composition(down_experts):
 
     per = kq.gather_qmm(
         x.reshape(B, 1, 1, K),
-        w, scales, "q2_k",
+        w,
+        scales,
+        "q2_k",
         rhs_indices=mx.array(ids_np).reshape(B, 1),
         transpose=True,
     )
     mx.eval(per)
-    ref = np.array(
-        per.astype(mx.float32), dtype=np.float64).reshape(B, N_DOWN).sum(axis=0)
+    ref = (
+        np.array(per.astype(mx.float32), dtype=np.float64)
+        .reshape(B, N_DOWN)
+        .sum(axis=0)
+    )
 
     # gather_qmm promotes float32 x to bfloat16 output before the host-side
     # sum, so the composition carries the rounding; the dq reference test
     # pins the fused kernel tightly.
     np.testing.assert_allclose(
-        np.array(got, dtype=np.float64).reshape(-1), ref, rtol=5e-2, atol=1e-2)
+        np.array(got, dtype=np.float64).reshape(-1), ref, rtol=5e-2, atol=1e-2
+    )
 
 
 def test_expert_sum_rejects_bad_inputs(down_experts):
@@ -351,13 +403,17 @@ def test_expert_sum_rejects_bad_inputs(down_experts):
         kq.gather_qmv_expert_sum(x, w, scales, "iq2_xxs", ids)
     with pytest.raises(ValueError):
         kq.gather_qmv_expert_sum(
-            x, w, scales, "q2_k", mx.array(np.zeros(6, dtype=np.int32)))
+            x, w, scales, "q2_k", mx.array(np.zeros(6, dtype=np.int32))
+        )
     with pytest.raises(ValueError):
         kq.gather_qmv_expert_sum(
-            x, w, scales, "q2_k", mx.array(np.zeros(4, dtype=np.uint32)))
+            x, w, scales, "q2_k", mx.array(np.zeros(4, dtype=np.uint32))
+        )
     with pytest.raises(ValueError):
         kq.gather_qmv_expert_sum(
-            mx.zeros((6, K // 2), dtype=mx.float32), w, scales, "q2_k", ids)
+            mx.zeros((6, K // 2), dtype=mx.float32), w, scales, "q2_k", ids
+        )
     with pytest.raises(ValueError):
         kq.gather_qmv_expert_sum(
-            mx.zeros((6, 1, K), dtype=mx.float32), w, scales, "q2_k", ids)
+            mx.zeros((6, 1, K), dtype=mx.float32), w, scales, "q2_k", ids
+        )

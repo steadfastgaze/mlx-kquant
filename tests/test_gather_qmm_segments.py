@@ -424,15 +424,12 @@ def _dr_tile_hashes(tile):
     return proc.stdout
 
 
-@pytest.mark.parametrize(
-    "tile", ["t48x128x16dr", "t48x128x16dr2", "t48x64x16dr"]
-)
+@pytest.mark.parametrize("tile", ["t48x128x16dr", "t48x128x16dr2", "t48x64x16dr"])
 def test_gather_qmm_segments_devr_bit_identical(tile):
     if mx.default_device() == mx.cpu:
         pytest.skip("register-direct opt-in is a GPU kernel path")
     default = _dr_tile_hashes(None)
     got = _dr_tile_hashes(tile)
     assert got == default, (
-        f"{tile} output hashes diverge from the default tile:\n"
-        f"{got}\nvs\n{default}"
+        f"{tile} output hashes diverge from the default tile:\n{got}\nvs\n{default}"
     )

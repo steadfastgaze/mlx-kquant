@@ -90,8 +90,7 @@ def test_vector_byte_uint4_is_default_with_strict_kill_switches_and_counters():
     assert 'std::string(unpack) == "0"' in host
     assert '"KQ_SDPA_Q8_VECTOR_BYTE_UNPACK must be 0 or 1."' in host
     assert (
-        'Q8LoaderConfig{ "uint4_byte_dynamic", '
-        "Q8LoaderArm::Uint4ByteDynamic}"
+        'Q8LoaderConfig{ "uint4_byte_dynamic", Q8LoaderArm::Uint4ByteDynamic}'
     ) in host
     assert 'Q8LoaderConfig{"uint4_dynamic", Q8LoaderArm::Uint4Dynamic}' in host
     assert 'Q8LoaderConfig{"scalar_dynamic", Q8LoaderArm::ScalarDynamic}' in host
@@ -139,8 +138,7 @@ def _loader_config_probe(
         [
             sys.executable,
             "-c",
-            "import mlx_kquant as kq; "
-            "print(kq.sdpa_q8_loader_debug()['selected_arm'])",
+            "import mlx_kquant as kq; print(kq.sdpa_q8_loader_debug()['selected_arm'])",
         ],
         env=env,
         capture_output=True,

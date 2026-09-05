@@ -138,6 +138,50 @@ def test_sdpa_vector_gqa(Hq, Hkv):
     _check(512, qL=4, kL=2048, dtype=mx.bfloat16, Hq=Hq, Hkv=Hkv)
 
 
+@pytest.mark.parametrize("D", [256, 512])
+def test_sdpa_vector_float16_long_context_stays_finite(D):
+    """Large value channels must survive the first reduction pass.
+
+    Nearly uniform scores make each partial accumulate many large values. The
+    materialized float32 calculation remains the independent reference.
+    """
+    B, Hq, Hkv, qL, kL = 1, 8, 1, 2, 16384
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make(B, Hq, Hkv, qL, kL, D, mx.float16, seed=37 + D, strided=False)
+    k = (k.astype(mx.float32) * 0.04).astype(mx.float16)
+    v[..., ::64] = 2048.0
+    mx.eval(k, v)
+
+    got = kq.sdpa_vector(q, k, v, scale, causal=False)
+    ref = _ref_sdpa(q, k, v, scale, causal=False)
+    _eval_or_skip(got, ref)
+
+    assert bool(mx.all(mx.isfinite(got.astype(mx.float32))).item())
+    rel = _rel(got, ref)
+    assert rel < REL_BOUND[mx.float16], f"D={D} relative error {rel:.3e}"
+
+
+def test_sdpa_vector_float16_wide_partials_keep_mask_and_sinks():
+    """The wider partial buffer preserves the local mask and sink behavior."""
+    B, Hq, Hkv, qL, kL, D = 1, 8, 1, 1, 8192, 256
+    scale = 1.0 / (D**0.5)
+    q, k, v = _make(B, Hq, Hkv, qL, kL, D, mx.float16, seed=61, strided=False)
+    k = (k.astype(mx.float32) * 0.04).astype(mx.float16)
+    v[..., ::64] = 2048.0
+    mask = (mx.arange(kL).reshape(1, 1, 1, kL) % 3) != 0
+    mask = mask | (mx.arange(kL).reshape(1, 1, 1, kL) == 0)
+    sinks = mx.linspace(-1.5, 2.5, Hq).astype(mx.float16)
+    mx.eval(k, v, mask, sinks)
+
+    got = kq.sdpa_vector(q, k, v, scale, causal=False, mask=mask, sinks=sinks)
+    ref = _ref_sdpa(q, k, v, scale, causal=False, mask=mask, sinks=sinks)
+    _eval_or_skip(got, ref)
+
+    assert bool(mx.all(mx.isfinite(got.astype(mx.float32))).item())
+    rel = _rel(got, ref)
+    assert rel < REL_BOUND[mx.float16], f"mask+sinks relative error {rel:.3e}"
+
+
 def _ref_sdpa_sinks(q, k, v, scale, sinks):
     """f32 reference with per-q-head sink logits: an extra softmax column
     with no value row (raises the max / adds to the denominator only).
@@ -435,19 +479,31 @@ def test_sdpa_fa_prefill_rejects_bad_geometry():
     v = mx.zeros((1, 2, 32, 256))
     # head_dim off contract.
     with pytest.raises(ValueError):
-        kq.sdpa_fa_prefill(mx.zeros((1, 16, 8, 128)), mx.zeros((1, 2, 32, 128)),
-                           mx.zeros((1, 2, 32, 128)), scale)
+        kq.sdpa_fa_prefill(
+            mx.zeros((1, 16, 8, 128)),
+            mx.zeros((1, 2, 32, 128)),
+            mx.zeros((1, 2, 32, 128)),
+            scale,
+        )
     # batch > 1.
     with pytest.raises(ValueError):
-        kq.sdpa_fa_prefill(mx.zeros((2, 16, 8, 256)), mx.zeros((2, 2, 32, 256)),
-                           mx.zeros((2, 2, 32, 256)), scale)
+        kq.sdpa_fa_prefill(
+            mx.zeros((2, 16, 8, 256)),
+            mx.zeros((2, 2, 32, 256)),
+            mx.zeros((2, 2, 32, 256)),
+            scale,
+        )
     # qw that does not fill a 32-row tile for the GQA factor (G=8 needs qw 4).
     with pytest.raises(ValueError):
         kq.sdpa_fa_prefill(q, k, v, scale, qw=3)
     # key length shorter than the query chunk.
     with pytest.raises(ValueError):
-        kq.sdpa_fa_prefill(mx.zeros((1, 16, 64, 256)), mx.zeros((1, 2, 8, 256)),
-                           mx.zeros((1, 2, 8, 256)), scale)
+        kq.sdpa_fa_prefill(
+            mx.zeros((1, 16, 64, 256)),
+            mx.zeros((1, 2, 8, 256)),
+            mx.zeros((1, 2, 8, 256)),
+            scale,
+        )
 
 
 # --- FA prefill, q8 past phase (the serving form) ----------------------------
@@ -469,19 +525,33 @@ def _make_q8_case(Hq, Hkv, qL, Lp, seed, strided):
         # The QuantizedKVCache state form: a seq-sliced view of a longer
         # buffer, so the head stride exceeds Lp * row.
         cap = Lp + 256
-        pk = tuple(x[..., :Lp, :] for x in mx.quantize(
-            mx.random.normal((1, Hkv, cap, 256), key=ks[3]).astype(mx.float32),
-            group_size=64, bits=8))
-        pv = tuple(x[..., :Lp, :] for x in mx.quantize(
-            mx.random.normal((1, Hkv, cap, 256), key=ks[4]).astype(mx.float32),
-            group_size=64, bits=8))
+        pk = tuple(
+            x[..., :Lp, :]
+            for x in mx.quantize(
+                mx.random.normal((1, Hkv, cap, 256), key=ks[3]).astype(mx.float32),
+                group_size=64,
+                bits=8,
+            )
+        )
+        pv = tuple(
+            x[..., :Lp, :]
+            for x in mx.quantize(
+                mx.random.normal((1, Hkv, cap, 256), key=ks[4]).astype(mx.float32),
+                group_size=64,
+                bits=8,
+            )
+        )
     else:
         pk = mx.quantize(
             mx.random.normal((1, Hkv, Lp, 256), key=ks[3]).astype(mx.float32),
-            group_size=64, bits=8)
+            group_size=64,
+            bits=8,
+        )
         pv = mx.quantize(
             mx.random.normal((1, Hkv, Lp, 256), key=ks[4]).astype(mx.float32),
-            group_size=64, bits=8)
+            group_size=64,
+            bits=8,
+        )
     mx.eval(q, self_k, self_v, list(pk), list(pv))
     return q, pk, pv, self_k, self_v
 
@@ -493,11 +563,11 @@ def _ref_q8_prefill(q, pk, pv, self_k, self_v, scale):
     Lp, qL = pk[0].shape[2], q.shape[2]
     g = Hq // Hkv
     kf = mx.concatenate(
-        [mx.dequantize(*pk, group_size=64, bits=8),
-         self_k.astype(mx.float32)], axis=2)
+        [mx.dequantize(*pk, group_size=64, bits=8), self_k.astype(mx.float32)], axis=2
+    )
     vf = mx.concatenate(
-        [mx.dequantize(*pv, group_size=64, bits=8),
-         self_v.astype(mx.float32)], axis=2)
+        [mx.dequantize(*pv, group_size=64, bits=8), self_v.astype(mx.float32)], axis=2
+    )
     kr = mx.repeat(kf, g, axis=1)
     vr = mx.repeat(vf, g, axis=1)
     s = (q * scale) @ kr.swapaxes(-1, -2)
@@ -508,13 +578,24 @@ def _ref_q8_prefill(q, pk, pv, self_k, self_v, scale):
     return mx.softmax(s, axis=-1, precise=True) @ vr
 
 
-def _check_q8(Hq, Hkv, qL, Lp, stage, seed=0, strided=False, qw=0, bq=0,
-              bk=0, splits=0):
+def _check_q8(
+    Hq, Hkv, qL, Lp, stage, seed=0, strided=False, qw=0, bq=0, bk=0, splits=0
+):
     scale = 1.0 / 16.0
     q, pk, pv, self_k, self_v = _make_q8_case(Hq, Hkv, qL, Lp, seed, strided)
-    got = kq.sdpa_fa_prefill_q8(q, *pk, *pv, self_k, self_v, scale,
-                                qw=qw, bq=bq, bk=bk, splits=splits,
-                                stage=stage)
+    got = kq.sdpa_fa_prefill_q8(
+        q,
+        *pk,
+        *pv,
+        self_k,
+        self_v,
+        scale,
+        qw=qw,
+        bq=bq,
+        bk=bk,
+        splits=splits,
+        stage=stage,
+    )
     ref = _ref_q8_prefill(q, pk, pv, self_k, self_v, scale)
     _eval_or_skip(got, ref)
     rel = _rel(got, ref)
@@ -568,15 +649,20 @@ def test_sdpa_fa_prefill_q8_half_precision_scales():
     self_v = mx.random.normal((1, 2, 128, 256), key=ks[2]).astype(mx.bfloat16)
     pk = mx.quantize(
         mx.random.normal((1, 2, 256, 256), key=ks[3]).astype(mx.float32),
-        group_size=64, bits=8)
+        group_size=64,
+        bits=8,
+    )
     pv = mx.quantize(
         mx.random.normal((1, 2, 256, 256), key=ks[4]).astype(mx.bfloat16),
-        group_size=64, bits=8)
+        group_size=64,
+        bits=8,
+    )
     assert pv[1].dtype == mx.bfloat16
     mx.eval(q, self_k, self_v, list(pk), list(pv))
     scale = 1.0 / 16.0
-    got = kq.sdpa_fa_prefill_q8(q, *pk, *pv, self_k, self_v, scale,
-                                bq=64, bk=48, stage=1)
+    got = kq.sdpa_fa_prefill_q8(
+        q, *pk, *pv, self_k, self_v, scale, bq=64, bk=48, stage=1
+    )
     ref = _ref_q8_prefill(q, pk, pv, self_k, self_v, scale)
     _eval_or_skip(got, ref)
     rel = _rel(got, ref)
@@ -586,18 +672,15 @@ def test_sdpa_fa_prefill_q8_half_precision_scales():
 
 def test_sdpa_fa_prefill_q8_rejects_bad_contract():
     scale = 1.0 / 16.0
-    q, pk, pv, self_k, self_v = _make_q8_case(16, 2, qL=8, Lp=64, seed=1,
-                                              strided=False)
+    q, pk, pv, self_k, self_v = _make_q8_case(16, 2, qL=8, Lp=64, seed=1, strided=False)
     # group size / bits off contract.
     with pytest.raises(ValueError):
-        kq.sdpa_fa_prefill_q8(q, *pk, *pv, self_k, self_v, scale,
-                              group_size=32)
+        kq.sdpa_fa_prefill_q8(q, *pk, *pv, self_k, self_v, scale, group_size=32)
     with pytest.raises(ValueError):
         kq.sdpa_fa_prefill_q8(q, *pk, *pv, self_k, self_v, scale, bits=4)
     # non-float32 queries.
     with pytest.raises(ValueError):
-        kq.sdpa_fa_prefill_q8(q.astype(mx.bfloat16), *pk, *pv, self_k,
-                              self_v, scale)
+        kq.sdpa_fa_prefill_q8(q.astype(mx.bfloat16), *pk, *pv, self_k, self_v, scale)
     # empty past (the dense kernel serves an empty cache).
     with pytest.raises(ValueError):
         empty_pk = tuple(x[..., :0, :] for x in pk)
@@ -605,12 +688,10 @@ def test_sdpa_fa_prefill_q8_rejects_bad_contract():
         kq.sdpa_fa_prefill_q8(q, *empty_pk, *empty_pv, self_k, self_v, scale)
     # bk not instantiated for the stage (float staging is bk 16 only).
     with pytest.raises(ValueError):
-        kq.sdpa_fa_prefill_q8(q, *pk, *pv, self_k, self_v, scale, bk=48,
-                              stage=2)
+        kq.sdpa_fa_prefill_q8(q, *pk, *pv, self_k, self_v, scale, bk=48, stage=2)
     # bk 48 requires the 64-row tile.
     with pytest.raises(ValueError):
-        kq.sdpa_fa_prefill_q8(q, *pk, *pv, self_k, self_v, scale, bk=48,
-                              bq=32, stage=1)
+        kq.sdpa_fa_prefill_q8(q, *pk, *pv, self_k, self_v, scale, bk=48, bq=32, stage=1)
 
 
 # --- fused q8 decode attention (the served KV-attention read) ----------------
@@ -630,19 +711,33 @@ def _make_q8_decode_case(Hq, Hkv, N, seed, strided):
         # The QuantizedKVCache state form: a seq-sliced view of a longer buffer,
         # so the head stride exceeds N * row.
         cap = N + 256
-        pk = tuple(x[..., :N, :] for x in mx.quantize(
-            mx.random.normal((1, Hkv, cap, 256), key=ks[1]).astype(mx.float32),
-            group_size=64, bits=8))
-        pv = tuple(x[..., :N, :] for x in mx.quantize(
-            mx.random.normal((1, Hkv, cap, 256), key=ks[2]).astype(mx.float32),
-            group_size=64, bits=8))
+        pk = tuple(
+            x[..., :N, :]
+            for x in mx.quantize(
+                mx.random.normal((1, Hkv, cap, 256), key=ks[1]).astype(mx.float32),
+                group_size=64,
+                bits=8,
+            )
+        )
+        pv = tuple(
+            x[..., :N, :]
+            for x in mx.quantize(
+                mx.random.normal((1, Hkv, cap, 256), key=ks[2]).astype(mx.float32),
+                group_size=64,
+                bits=8,
+            )
+        )
     else:
         pk = mx.quantize(
             mx.random.normal((1, Hkv, N, 256), key=ks[1]).astype(mx.float32),
-            group_size=64, bits=8)
+            group_size=64,
+            bits=8,
+        )
         pv = mx.quantize(
             mx.random.normal((1, Hkv, N, 256), key=ks[2]).astype(mx.float32),
-            group_size=64, bits=8)
+            group_size=64,
+            bits=8,
+        )
     mx.eval(q, list(pk), list(pv))
     return q, pk, pv
 
@@ -806,17 +901,12 @@ def test_sdpa_decode_q8_uint4_alignment_fallback_is_exact():
     aligned = kq.sdpa_decode_q8(q, *pk, *pv, scale, **kwargs)
     mx.eval(aligned)
     loader_after_aligned = kq.sdpa_q8_loader_debug()
-    unaligned = kq.sdpa_decode_q8(
-        q, *unaligned_pk, *unaligned_pv, scale, **kwargs
-    )
+    unaligned = kq.sdpa_decode_q8(q, *unaligned_pk, *unaligned_pv, scale, **kwargs)
     mx.eval(unaligned)
     loader_after_unaligned = kq.sdpa_q8_loader_debug()
 
     assert bool(mx.array_equal(aligned, unaligned))
-    assert (
-        loader_after_aligned[selected]
-        == loader_before[selected] + 1
-    )
+    assert loader_after_aligned[selected] == loader_before[selected] + 1
     assert (
         loader_after_unaligned["scalar_dynamic"]
         == loader_after_aligned["scalar_dynamic"] + 1
@@ -953,8 +1043,7 @@ def test_sdpa_decode_q8_explicit_splits():
     # Off-boundary depths at several fixed split counts (empty-split partials at
     # the tail must merge with weight zero).
     for splits in (1, 8, 16, 64):
-        _check_q8_decode(3071, stage=2, seed=100 + splits, splits=splits,
-                         compute=0)
+        _check_q8_decode(3071, stage=2, seed=100 + splits, splits=splits, compute=0)
 
 
 def test_sdpa_decode_q8_dequant_exact():
@@ -976,10 +1065,14 @@ def test_sdpa_decode_q8_half_precision_scales():
     q = mx.random.normal((1, 16, 1, 256), key=ks[0]).astype(mx.float32)
     pk = mx.quantize(
         mx.random.normal((1, 2, 512, 256), key=ks[1]).astype(mx.float32),
-        group_size=64, bits=8)
+        group_size=64,
+        bits=8,
+    )
     pv = mx.quantize(
         mx.random.normal((1, 2, 512, 256), key=ks[2]).astype(mx.bfloat16),
-        group_size=64, bits=8)
+        group_size=64,
+        bits=8,
+    )
     assert pv[1].dtype == mx.bfloat16
     mx.eval(q, list(pk), list(pv))
     scale = 1.0 / 16.0

@@ -50,9 +50,7 @@ const Q8LoaderConfig& q8_loader_config() {
       throw std::runtime_error("KQ_SDPA_Q8_UINT4_LOAD must be 0 or 1.");
     }
     const char* unpack = std::getenv("KQ_SDPA_Q8_VECTOR_BYTE_UNPACK");
-    if (
-        unpack == nullptr || unpack[0] == '\0' ||
-        std::string(unpack) == "1") {
+    if (unpack == nullptr || unpack[0] == '\0' || std::string(unpack) == "1") {
       return Q8LoaderConfig{
           "uint4_byte_dynamic", Q8LoaderArm::Uint4ByteDynamic};
     }
@@ -194,7 +192,11 @@ void KQuantSDPA::eval_gpu(
   // Per-block partials + running max/sum, reduced by pass 2.
   mx::Shape part_shape = {B, n_q_heads, qL, blocks, D};
   mx::Shape red_shape = {B, n_q_heads, qL, blocks};
-  array partials(part_shape, q.dtype(), nullptr, {});
+  // The stored state is not normalized until pass 2. Float16 inputs therefore
+  // use float32 partials to avoid overflowing at long context; bfloat16 keeps
+  // its original 16-bit storage and wider exponent range.
+  auto part_dtype = q.dtype() == mx::float16 ? mx::float32 : q.dtype();
+  array partials(part_shape, part_dtype, nullptr, {});
   array sums(red_shape, mx::float32, nullptr, {});
   array maxs(red_shape, mx::float32, nullptr, {});
   partials.set_data(mx::allocator::malloc(partials.nbytes()));
@@ -274,8 +276,8 @@ void KQuantSDPA::eval_gpu(
   {
     std::string kname =
         "kq_sdpa_vector_2pass_2_" + ts + "_" + std::to_string(D);
-    std::string hash = kname + "_b" + std::to_string(blocks) +
-        (with_sinks ? "_s1" : "_s0");
+    std::string hash =
+        kname + "_b" + std::to_string(blocks) + (with_sinks ? "_s1" : "_s0");
     auto kernel = kq_get_kernel(d, kname, hash, fc);
     ce.set_compute_pipeline_state(kernel);
     ce.set_input_array(partials, 0);
@@ -564,8 +566,8 @@ void KQuantSDPAFAPrefill::eval_gpu(
   size_t v_seq_stride = static_cast<size_t>(v.strides(2));
   float scale = scale_;
 
-  // Per-split partials (float32) + running max/sum in the [B, Hq, qL, splits, D]
-  // layout the shared merge reads with grid (Hq, B, qL).
+  // Per-split partials (float32) + running max/sum in the [B, Hq, qL, splits,
+  // D] layout the shared merge reads with grid (Hq, B, qL).
   mx::Shape part_shape = {B, n_q_heads, qL, splits, D};
   mx::Shape red_shape = {B, n_q_heads, qL, splits};
   array partials(part_shape, mx::float32, nullptr, {});
@@ -1175,9 +1177,8 @@ mx::array sdpa_vector(
   std::vector<mx::array> inputs = {
       std::move(q_c), std::move(k_c), std::move(v_c)};
   if (mask.has_value()) {
-    auto m = mask->strides().back() == 1
-        ? *mask
-        : mx::contiguous(*mask, false, s);
+    auto m =
+        mask->strides().back() == 1 ? *mask : mx::contiguous(*mask, false, s);
     inputs.push_back(std::move(m));
   }
   if (sinks.has_value()) {
@@ -1513,8 +1514,8 @@ std::vector<mx::Shape> KQuantSDPAFAPrefillQ8::output_shapes(
 
 bool KQuantSDPAFAPrefillQ8::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantSDPAFAPrefillQ8&>(other);
-  return scale_ == o.scale_ && qw_ == o.qw_ && bq_ == o.bq_ &&
-      bk_ == o.bk_ && splits_ == o.splits_ && stage_ == o.stage_;
+  return scale_ == o.scale_ && qw_ == o.qw_ && bq_ == o.bq_ && bk_ == o.bk_ &&
+      splits_ == o.splits_ && stage_ == o.stage_;
 }
 
 void KQuantSDPADecodeQ8::eval_cpu(
@@ -1612,8 +1613,8 @@ mx::array sdpa_fa_prefill_q8(
         "kernel serves an empty cache).");
   }
   const int el_per_word = 4; // 8-bit values per uint32
-  if (pk_w.shape(3) != D / el_per_word ||
-      pk_s.shape(3) != D / group_size || pk_b.shape(3) != D / group_size) {
+  if (pk_w.shape(3) != D / el_per_word || pk_s.shape(3) != D / group_size ||
+      pk_b.shape(3) != D / group_size) {
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_fa_prefill_q8] past K tuple last dims do not match "
         "head_dim 256 at group 64 / 8 bits.");
@@ -1630,8 +1631,8 @@ mx::array sdpa_fa_prefill_q8(
         "heads, length, and packing geometry.");
   }
   if (self_k.shape(1) != n_kv_heads || self_v.shape(1) != n_kv_heads ||
-      self_k.shape(2) != qL || self_v.shape(2) != qL ||
-      self_k.shape(3) != D || self_v.shape(3) != D) {
+      self_k.shape(2) != qL || self_v.shape(2) != qL || self_k.shape(3) != D ||
+      self_v.shape(3) != D) {
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_fa_prefill_q8] self k/v must be [1, n_kv_heads, "
         "qL, 256].");
@@ -1668,8 +1669,8 @@ mx::array sdpa_fa_prefill_q8(
   }
   // Instantiated key-tile widths: half staging 32 (any bq) or 48 (bq 64);
   // float32 staging 16.
-  const bool bk_ok = bk == 0 ||
-      (stage == 2 ? bk == 16 : (bk == 32 || (bk == 48 && bq == 64)));
+  const bool bk_ok =
+      bk == 0 || (stage == 2 ? bk == 16 : (bk == 32 || (bk == 48 && bq == 64)));
   if (!bk_ok) {
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_fa_prefill_q8] bk not instantiated for this stage "
@@ -1806,8 +1807,8 @@ mx::array sdpa_decode_q8(
         "[mlx_kquant.sdpa_decode_q8] cache length must be >= 1.");
   }
   const int el_per_word = 4; // 8-bit values per uint32
-  if (pk_w.shape(3) != D / el_per_word ||
-      pk_s.shape(3) != D / group_size || pk_b.shape(3) != D / group_size) {
+  if (pk_w.shape(3) != D / el_per_word || pk_s.shape(3) != D / group_size ||
+      pk_b.shape(3) != D / group_size) {
     throw std::invalid_argument(
         "[mlx_kquant.sdpa_decode_q8] K tuple last dims do not match head_dim "
         "256 at group 64 / 8 bits.");

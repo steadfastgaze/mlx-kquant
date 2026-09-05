@@ -215,6 +215,21 @@ The `[tools]` layer is itself a worked reference for wiring `kq.*` into the MLX 
 encoder, layer modules, and the mlx-lm monkeypatch are all small and self-contained. See
 **[docs/integration.md](https://github.com/asher/mlx-kquant/blob/main/docs/integration.md)** if you're building on the ops.
 
+### Qwen Flash-Next decode primitives
+
+The ops layer includes Metal-only primitives for the fixed Qwen Flash-Next
+decode geometry. They cover the four-branch gated residual stages, GDN
+preparation and the Q6_K pre-router envelope, exact top-10 routing over 512
+experts, Q6_K QSA projection with partial RoPE, and stable QSA selection with
+mutable K4/V4 cache-row reconstruction.
+
+These are low-level integration boundaries rather than a general model loader.
+Each operation validates the complete shape, dtype, and cache-layout contract
+and rejects unsupported inputs. The K4/V4 cache records use the
+variance-normalized tiled representation described by
+[KVarN](https://arxiv.org/abs/2606.03458); cache mutation and transaction
+management remain the caller's responsibility.
+
 ## Performance
 
 The Metal kernels use a single-pass NAX matmul and matrix-contiguity handling for fused MoE expert
@@ -364,7 +379,8 @@ MIT - see [LICENSE](https://github.com/asher/mlx-kquant/blob/main/LICENSE).
 
 ### Acknowledgements
 
-mlx-kquant builds on three MIT-licensed projects; their license texts ship in the wheel under
+mlx-kquant builds on the projects below. License texts for bundled or adapted
+source ship in the wheel under
 [`mlx_kquant/licenses/`](https://github.com/asher/mlx-kquant/tree/main/mlx_kquant/licenses):
 
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)** - the K-quant, IQ, and legacy block
@@ -375,3 +391,8 @@ mlx-kquant builds on three MIT-licensed projects; their license texts ship in th
 - **[MLX](https://github.com/ml-explore/mlx)** - the extension links `libmlx`, the kernels compile
   against MLX's bundled headers, and parts of the Metal kernels are adapted from MLX's quantized and
   steel-GEMM kernels.
+- **[KVarN](https://github.com/huawei-csl/KVarN)** - the Qwen K4/V4 cache-row
+  reconstruction adapts its Apache-2.0 variance-normalized tiled cache design.
+  The pinned revision and local modifications are recorded in
+  [`kvarn-NOTICE`](mlx_kquant/licenses/kvarn-NOTICE), and the license text ships
+  as [`kvarn-LICENSE`](mlx_kquant/licenses/kvarn-LICENSE).

@@ -133,6 +133,34 @@ def test_add_rmsnorm_3d_and_noncontiguous():
     assert _rel(got_s, ref_s) < _tol(mx.bfloat16)
 
 
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_add_rmsnorm_lazy_strides_are_compacted(dtype):
+    """Deferred slices for activations, weight, and scale use their real layout."""
+    mx.random.seed(29)
+    rows, width = 3, 512
+    h_storage = mx.random.normal((rows, width * 2)).astype(dtype)
+    residual_storage = mx.random.normal((rows, width * 2)).astype(dtype)
+    weight_storage = (1.0 + 0.1 * mx.random.normal((width * 2,))).astype(dtype)
+    scale_storage = mx.array([0.67, -3.0]).astype(dtype)
+
+    # Keep these views lazy until the fused op is evaluated. Their placeholder
+    # flags are not a valid substitute for the evaluated strides.
+    h = h_storage[:, ::2]
+    residual = residual_storage[:, 1::2]
+    weight = weight_storage[::2]
+    scale = scale_storage[::2]
+
+    got = kq.add_rmsnorm(h, residual, weight, EPS, scale=scale)
+    ref = (
+        residual.astype(mx.float32)
+        + _rms_ref(h.astype(mx.float32), weight.astype(mx.float32))
+    ) * scale.astype(mx.float32)
+    mx.eval(got, ref)
+
+    assert got.shape == (rows, width)
+    assert _rel(got, ref) < _tol(dtype)
+
+
 def test_validation_errors():
     h = mx.zeros((2, 64), dtype=mx.bfloat16)
     w = mx.ones((64,), dtype=mx.bfloat16)

@@ -1109,8 +1109,8 @@ mx::array gather_qmv_expert_sum(
       ids.shape(0) != x.shape(0)) {
     std::ostringstream msg;
     msg << "[mlx_kquant.gather_qmv_expert_sum] ids must be 1-D uint32 with "
-        << "one id per x row (" << x.shape(0) << ") but got "
-        << ids.shape() << " " << ids.dtype() << ".";
+        << "one id per x row (" << x.shape(0) << ") but got " << ids.shape()
+        << " " << ids.dtype() << ".";
     throw std::invalid_argument(msg.str());
   }
   int N = w.shape(-2);

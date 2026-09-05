@@ -98,10 +98,8 @@ def main():
     )
     x, w, scales, seg, ids = build()
 
-    srt_dt, srt_out = time_op(
-        lambda: kq.gather_qmm_sorted(x, w, scales, CODEC, ids))
-    seg_dt, seg_out = time_op(
-        lambda: kq.gather_qmm_segments(x, w, scales, CODEC, seg))
+    srt_dt, srt_out = time_op(lambda: kq.gather_qmm_sorted(x, w, scales, CODEC, ids))
+    seg_dt, seg_out = time_op(lambda: kq.gather_qmm_segments(x, w, scales, CODEC, seg))
 
     # Bit-identity check: the two entry points share one segment-GEMM body.
     g = np.array(srt_out.astype(mx.float32))

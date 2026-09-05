@@ -127,6 +127,130 @@ mx::array quantized_matmul_qmv_add_hc_post(
     const std::string& kquant_type,
     mx::StreamOrDevice s = {});
 
+// Fixed-geometry Qwen Flash-Next decode boundaries. These Metal-only
+// operations preserve the BF16 arithmetic and storage layouts used by the
+// supported four-branch, width-2560 graph.
+std::vector<mx::array> qwen4_hc_norm(
+    mx::array residual,
+    mx::array norm_weight,
+    const std::optional<mx::array>& pending_output,
+    const std::optional<mx::array>& pending_injection,
+    float eps,
+    mx::StreamOrDevice s = {});
+
+std::vector<mx::array> qwen4_hc_front(
+    mx::array normalized,
+    mx::array down_weight,
+    mx::array down_scales,
+    const std::optional<mx::array>& injection_weight,
+    const std::optional<mx::array>& injection_scales,
+    mx::StreamOrDevice s = {});
+
+mx::array qwen4_hc_epilogue(
+    mx::array lowrank,
+    mx::array up_weight,
+    mx::array up_scales,
+    mx::array normalized,
+    mx::StreamOrDevice s = {});
+
+std::vector<mx::array> qwen4_gdn_prepare(
+    mx::array qkv,
+    mx::array beta_logits,
+    mx::array decay_logits,
+    mx::array conv_state,
+    mx::array conv_weight,
+    mx::array a_log,
+    mx::array dt_bias,
+    mx::StreamOrDevice s = {});
+
+mx::array qwen4_gdn_norm_gate(
+    mx::array recurrence,
+    mx::array gate,
+    mx::array norm_weight,
+    float eps,
+    mx::StreamOrDevice s = {});
+
+// Fixed one-token pre-router layer envelope. Router selection and the routed
+// expert block remain outside this operation.
+std::vector<mx::array> qwen4_gdn_prerouter_q6(
+    mx::array hidden,
+    mx::array attention_norm_weight,
+    mx::array attention_down_weight,
+    mx::array attention_down_scales,
+    mx::array attention_injection_weight,
+    mx::array attention_injection_scales,
+    mx::array attention_up_weight,
+    mx::array attention_up_scales,
+    mx::array mlp_norm_weight,
+    mx::array mlp_down_weight,
+    mx::array mlp_down_scales,
+    mx::array mlp_injection_weight,
+    mx::array mlp_injection_scales,
+    mx::array mlp_up_weight,
+    mx::array mlp_up_scales,
+    mx::array qkv_weight,
+    mx::array qkv_scales,
+    mx::array gate_weight,
+    mx::array gate_scales,
+    mx::array beta_weight,
+    mx::array beta_scales,
+    mx::array decay_weight,
+    mx::array decay_scales,
+    mx::array conv_state,
+    mx::array conv_weight,
+    mx::array a_log,
+    mx::array dt_bias,
+    mx::array recurrent_state,
+    mx::array gdn_norm_weight,
+    mx::array gdn_out_weight,
+    mx::array gdn_out_scales,
+    const std::optional<mx::array>& pending_output,
+    const std::optional<mx::array>& pending_injection,
+    float eps,
+    mx::StreamOrDevice s = {});
+
+// Stable top-10 routing for BF16 rows with 512 expert logits. Returns expert
+// ids and normalized BF16 scores in score order.
+std::vector<mx::array> qwen4_router_topk_fused_exact(
+    mx::array logits,
+    mx::StreamOrDevice s = {});
+
+// Stable QSA selection and mutable K4/V4 row reconstruction. The returned K/V
+// rows are flat token-major BF16 arrays; cache state is not modified.
+std::vector<mx::array> qwen4_qsa_select_gather_k4v4(
+    mx::array scores,
+    mx::array records,
+    mx::array exact_sink_keys,
+    mx::array exact_sink_values,
+    mx::array exact_tail_keys,
+    mx::array exact_tail_values,
+    mx::array pending_keys,
+    mx::array pending_values,
+    int visible_count,
+    int frontier,
+    mx::StreamOrDevice s = {});
+
+// Q6_K QSA projections followed by exact normalization and shared partial
+// RoPE for one decode token. Cache state is not modified.
+std::vector<mx::array> qwen4_qsa_project_rope_q6(
+    mx::array hidden,
+    mx::array index_weight,
+    mx::array index_scales,
+    mx::array query_weight,
+    mx::array query_scales,
+    mx::array key_weight,
+    mx::array key_scales,
+    mx::array value_weight,
+    mx::array value_scales,
+    mx::array index_query_norm_weight,
+    mx::array query_norm_weight,
+    mx::array key_norm_weight,
+    mx::array rope_cosine,
+    mx::array rope_sine,
+    mx::array position_ids,
+    float eps,
+    mx::StreamOrDevice s = {});
+
 // Gather (mixture-of-experts) quantized matmul: for each output row, select an
 // expert weight matrix via `rhs_indices` and an x row via `lhs_indices`, then
 // matmul. `w` is uint8 K-quant wire bytes shaped (n_experts, N, bytes_per_row);
@@ -738,6 +862,204 @@ class KQuantQmvAddHCPost : public mx::Primitive {
   bool is_equivalent(const mx::Primitive& other) const override;
 };
 
+class KQuantQwen4HCNorm : public mx::Primitive {
+ public:
+  explicit KQuantQwen4HCNorm(mx::Stream stream, float eps, bool has_pending)
+      : mx::Primitive(stream), eps_(eps), has_pending_(has_pending) {}
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+  const char* name() const override {
+    return "KQuantQwen4HCNorm";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float eps_;
+  bool has_pending_;
+};
+
+class KQuantQwen4HCFront : public mx::Primitive {
+ public:
+  explicit KQuantQwen4HCFront(mx::Stream stream, bool has_injection)
+      : mx::Primitive(stream), has_injection_(has_injection) {}
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+  const char* name() const override {
+    return "KQuantQwen4HCFront";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  bool has_injection_;
+};
+
+class KQuantQwen4HCEpilogue : public mx::Primitive {
+ public:
+  explicit KQuantQwen4HCEpilogue(mx::Stream stream) : mx::Primitive(stream) {}
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+  const char* name() const override {
+    return "KQuantQwen4HCEpilogue";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+};
+
+class KQuantQwen4GDNPrepare : public mx::Primitive {
+ public:
+  explicit KQuantQwen4GDNPrepare(mx::Stream stream) : mx::Primitive(stream) {}
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+  const char* name() const override {
+    return "KQuantQwen4GDNPrepare";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+};
+
+class KQuantQwen4GDNNormGate : public mx::Primitive {
+ public:
+  explicit KQuantQwen4GDNNormGate(mx::Stream stream, float eps)
+      : mx::Primitive(stream), eps_(eps) {}
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+  const char* name() const override {
+    return "KQuantQwen4GDNNormGate";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float eps_;
+};
+
+class KQuantQwen4GDNPreRouterQ6 : public mx::Primitive {
+ public:
+  explicit KQuantQwen4GDNPreRouterQ6(
+      mx::Stream stream,
+      float eps,
+      bool has_pending)
+      : mx::Primitive(stream), eps_(eps), has_pending_(has_pending) {}
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+  const char* name() const override {
+    return "KQuantQwen4GDNPreRouterQ6";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float eps_;
+  bool has_pending_;
+};
+
+class KQuantQwen4QSASelectGatherK4V4 : public mx::Primitive {
+ public:
+  explicit KQuantQwen4QSASelectGatherK4V4(
+      mx::Stream stream,
+      int group_count,
+      int visible_count,
+      int record_count,
+      int tail_tokens,
+      int frontier)
+      : mx::Primitive(stream),
+        group_count_(group_count),
+        visible_count_(visible_count),
+        record_count_(record_count),
+        tail_tokens_(tail_tokens),
+        frontier_(frontier) {}
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+  const char* name() const override {
+    return "KQuantQwen4QSASelectGatherK4V4";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  int group_count_;
+  int visible_count_;
+  int record_count_;
+  int tail_tokens_;
+  int frontier_;
+};
+
+class KQuantQwen4QSAProjectRopeQ6 : public mx::Primitive {
+ public:
+  explicit KQuantQwen4QSAProjectRopeQ6(mx::Stream stream, float eps)
+      : mx::Primitive(stream), eps_(eps) {}
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+  const char* name() const override {
+    return "KQuantQwen4QSAProjectRopeQ6";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+
+ private:
+  float eps_;
+};
+
+class KQuantQwen4RouterFusedExact : public mx::Primitive {
+ public:
+  explicit KQuantQwen4RouterFusedExact(mx::Stream stream)
+      : mx::Primitive(stream) {}
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+  std::vector<mx::Shape> output_shapes(
+      const std::vector<mx::array>& inputs) override;
+  const char* name() const override {
+    return "KQuantQwen4RouterFusedExact";
+  }
+  bool is_equivalent(const mx::Primitive& other) const override;
+};
+
 // Vector SDPA for large head dims. Inference-only: jvp/vjp/vmap inherit the
 // base-class throwing defaults. eval_cpu throws (Metal-only kernel).
 class KQuantSDPA : public mx::Primitive {
@@ -842,7 +1164,11 @@ class KQuantSDPAFAVerify : public mx::Primitive {
 // Inference-only.
 class KQuantSDPAFAPrefill : public mx::Primitive {
  public:
-  explicit KQuantSDPAFAPrefill(mx::Stream stream, float scale, int qw, int splits)
+  explicit KQuantSDPAFAPrefill(
+      mx::Stream stream,
+      float scale,
+      int qw,
+      int splits)
       : mx::Primitive(stream), scale_(scale), qw_(qw), splits_(splits) {}
 
   void eval_cpu(

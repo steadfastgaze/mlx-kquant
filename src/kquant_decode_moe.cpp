@@ -108,8 +108,7 @@ std::vector<mx::Shape> KQuantGatherQMVExpertSum::output_shapes(
   return {mx::Shape{1, w.shape(-2)}};
 }
 
-bool KQuantGatherQMVExpertSum::is_equivalent(
-    const mx::Primitive& other) const {
+bool KQuantGatherQMVExpertSum::is_equivalent(const mx::Primitive& other) const {
   const auto& o = static_cast<const KQuantGatherQMVExpertSum&>(other);
   return kquant_type_ == o.kquant_type_ && group_size_ == o.group_size_ &&
       bits_ == o.bits_;
@@ -141,9 +140,9 @@ void KQuantGatherQMVExpertSum::eval_gpu(
   MTL::Size grid_dims(1, (N + bn - 1) / bn, 1);
 
   std::string type_string = kq_type_string(x.dtype());
-  std::string kname = kq_kname_prefix(kquant_type_) +
-      "gather_qmv_expert_sum_" + type_string + "_gs_" +
-      std::to_string(group_size_) + "_b_" + std::to_string(bits_);
+  std::string kname = kq_kname_prefix(kquant_type_) + "gather_qmv_expert_sum_" +
+      type_string + "_gs_" + std::to_string(group_size_) + "_b_" +
+      std::to_string(bits_);
 
   auto kernel = kq_get_kernel(d, kname);
   auto& ce = mx::metal::get_command_encoder(s);

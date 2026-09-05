@@ -1,0 +1,10 @@
+KVarN
+Source: https://github.com/huawei-csl/KVarN
+Revision: 7586257f1c632e63187bfacbbe21ccb51540f7b3
+License: Apache-2.0
+
+The Qwen K4/V4 cache codec adapts the published variance-normalized numeric
+method and tiled representation to a fixed Qwen Flash-Next geometry. The
+implementation stores K/V code payloads token-major, removes vLLM allocator
+padding, reconstructs only selected physical rows, and writes BF16 outputs. No
+vLLM allocator or serving code is included.

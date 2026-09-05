@@ -20,12 +20,12 @@ constant bool gqa_has_sinks [[function_constant(3)]];
 constant bool has_mask [[function_constant(4)]];
 constant bool has_sinks [[function_constant(5)]];
 
-template <typename T, int D, int V = D>
+template <typename T, typename PT, int D, int V = D>
 [[kernel]] void kq_sdpa_vector_2pass_1(
     const device T* queries [[buffer(0)]],
     const device T* keys [[buffer(1)]],
     const device T* values [[buffer(2)]],
-    device T* out [[buffer(3)]],
+    device PT* out [[buffer(3)]],
     device float* sums [[buffer(4)]],
     device float* maxs [[buffer(5)]],
     const constant int& N [[buffer(6)]],
@@ -36,11 +36,11 @@ template <typename T, int D, int V = D>
     const constant float& scale [[buffer(11)]],
     const device bool* mask [[buffer(12), function_constant(has_mask)]],
     const constant size_t& m_batch_stride
-        [[buffer(13), function_constant(has_mask)]],
+    [[buffer(13), function_constant(has_mask)]],
     const constant size_t& m_head_stride
-        [[buffer(14), function_constant(has_mask)]],
+    [[buffer(14), function_constant(has_mask)]],
     const constant size_t& m_q_stride
-        [[buffer(15), function_constant(has_mask)]],
+    [[buffer(15), function_constant(has_mask)]],
     uint3 tptg [[threads_per_threadgroup]],
     uint3 tidtg [[thread_position_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -124,19 +124,18 @@ template <typename T, int D, int V = D>
     maxs[0] = max_score;
   }
   for (int i = 0; i < v_per_thread; i++) {
-    out[i] = static_cast<T>(o[i]);
+    out[i] = static_cast<PT>(o[i]);
   }
 }
 
-template <typename T, int D>
+template <typename T, typename PT, int D>
 [[kernel]] void kq_sdpa_vector_2pass_2(
-    const device T* partials [[buffer(0)]],
+    const device PT* partials [[buffer(0)]],
     const device float* sums [[buffer(1)]],
     const device float* maxs [[buffer(2)]],
     device T* out [[buffer(3)]],
     const device float* sinks [[buffer(4), function_constant(has_sinks)]],
-    const constant int& num_q_heads
-        [[buffer(5), function_constant(has_sinks)]],
+    const constant int& num_q_heads [[buffer(5), function_constant(has_sinks)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 tpg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -720,10 +719,10 @@ template <typename T, int D>
 // contiguous key array. The q8 past-phase variant streams the past prefix from
 // the quantized cache instead (kq_sdpa_fa_prefill_q8_2pass_1).
 //
-// BK is the keys staged per tile. A float32 K/V path stages 4 bytes per element,
-// so BK=32 at D=256 overflows the 32 KB threadgroup limit (LDK*D*4 = 36 KB);
-// the float instantiation uses BK=16 (LDK*D*4 = 20 KB). Half-precision paths
-// keep BK=32.
+// BK is the keys staged per tile. A float32 K/V path stages 4 bytes per
+// element, so BK=32 at D=256 overflows the 32 KB threadgroup limit (LDK*D*4 =
+// 36 KB); the float instantiation uses BK=16 (LDK*D*4 = 20 KB). Half-precision
+// paths keep BK=32.
 template <typename T, int D, int QW, int BK = 32>
 [[kernel]] void kq_sdpa_fa_prefill_2pass_1(
     const device T* queries [[buffer(0)]],
@@ -772,10 +771,10 @@ template <typename T, int D, int QW, int BK = 32>
   const int k0 = split_idx * chunk;
   const int k1 = min(k0 + chunk, N);
 
-  const device T* kbase = keys +
-      (size_t)kv_head_idx * k_head_stride + (size_t)k0 * k_seq_stride;
-  const device T* vbase = values +
-      (size_t)kv_head_idx * v_head_stride + (size_t)k0 * v_seq_stride;
+  const device T* kbase =
+      keys + (size_t)kv_head_idx * k_head_stride + (size_t)k0 * k_seq_stride;
+  const device T* vbase =
+      values + (size_t)kv_head_idx * v_head_stride + (size_t)k0 * v_seq_stride;
 
   KLoader loader_k(
       kbase, static_cast<int>(k_seq_stride), KV_smem, simd_gid, simd_lid);
@@ -1085,8 +1084,9 @@ template <typename StageT, int D, int QW, int BK, int BQ>
     for (int w = r_past * kWPR + flat; w < r_live * kWPR; w += n_threads) {
       const int r = w / kWPR;
       const int c4 = w % kWPR;
-      const float4 x = *(const device float4*)(self_k + hk * p.sk_head +
-          (size_t)(kt + r - Lp) * p.sk_seq + c4 * 4);
+      const float4 x =
+          *(const device float4*)(self_k + hk * p.sk_head +
+                                  (size_t)(kt + r - Lp) * p.sk_seq + c4 * 4);
       const int c = c4 * 4;
       KV_smem[(c + 0) * LDK + r] = StageT(x.x);
       KV_smem[(c + 1) * LDK + r] = StageT(x.y);
@@ -1161,8 +1161,9 @@ template <typename StageT, int D, int QW, int BK, int BQ>
     for (int w = r_past * kWPR + flat; w < r_live * kWPR; w += n_threads) {
       const int r = w / kWPR;
       const int c4 = w % kWPR;
-      const float4 x = *(const device float4*)(self_v + hk * p.sv_head +
-          (size_t)(kt + r - Lp) * p.sv_seq + c4 * 4);
+      const float4 x =
+          *(const device float4*)(self_v + hk * p.sv_head +
+                                  (size_t)(kt + r - Lp) * p.sv_seq + c4 * 4);
       *(threadgroup Stage4*)(KV_smem + r * LDV + c4 * 4) =
           Stage4(StageT(x.x), StageT(x.y), StageT(x.z), StageT(x.w));
     }

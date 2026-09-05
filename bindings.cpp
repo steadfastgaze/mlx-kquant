@@ -218,6 +218,182 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "qwen4_hc_norm",
+      &mlx_kquant::qwen4_hc_norm,
+      "residual"_a,
+      "norm_weight"_a,
+      "pending_output"_a = nb::none(),
+      "pending_injection"_a = nb::none(),
+      "eps"_a = 1e-6f,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Apply the fixed Qwen four-branch residual update and zero-centered
+        RMS normalization in one decode-only Metal dispatch.
+      )");
+
+  m.def(
+      "qwen4_hc_front",
+      &mlx_kquant::qwen4_hc_front,
+      "normalized"_a,
+      "down_weight"_a,
+      "down_scales"_a,
+      "injection_weight"_a = nb::none(),
+      "injection_scales"_a = nb::none(),
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Apply the Q6_K low-rank read and optional residual-injection
+        projection in one decode-only Metal dispatch.
+      )");
+
+  m.def(
+      "qwen4_hc_epilogue",
+      &mlx_kquant::qwen4_hc_epilogue,
+      "lowrank"_a,
+      "up_weight"_a,
+      "up_scales"_a,
+      "normalized"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Apply the Q8_0 low-rank up projection, sigmoid gate, and four-branch
+        reduction in one decode-only Metal dispatch.
+      )");
+
+  m.def(
+      "qwen4_gdn_prepare",
+      &mlx_kquant::qwen4_gdn_prepare,
+      "qkv"_a,
+      "beta_logits"_a,
+      "decay_logits"_a,
+      "conv_state"_a,
+      "conv_weight"_a,
+      "a_log"_a,
+      "dt_bias"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Prepare one-token Qwen gated-delta recurrence inputs and convolution
+        state using the fixed released geometry.
+      )");
+
+  m.def(
+      "qwen4_gdn_norm_gate",
+      &mlx_kquant::qwen4_gdn_norm_gate,
+      "recurrence"_a,
+      "gate"_a,
+      "norm_weight"_a,
+      "eps"_a = 1e-6f,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Apply per-head GDN RMS normalization and the sigmoid output gate for
+        the fixed one-token Qwen geometry.
+      )");
+
+  m.def(
+      "qwen4_gdn_prerouter_q6",
+      &mlx_kquant::qwen4_gdn_prerouter_q6,
+      "hidden"_a,
+      "attention_norm_weight"_a,
+      "attention_down_weight"_a,
+      "attention_down_scales"_a,
+      "attention_injection_weight"_a,
+      "attention_injection_scales"_a,
+      "attention_up_weight"_a,
+      "attention_up_scales"_a,
+      "mlp_norm_weight"_a,
+      "mlp_down_weight"_a,
+      "mlp_down_scales"_a,
+      "mlp_injection_weight"_a,
+      "mlp_injection_scales"_a,
+      "mlp_up_weight"_a,
+      "mlp_up_scales"_a,
+      "qkv_weight"_a,
+      "qkv_scales"_a,
+      "gate_weight"_a,
+      "gate_scales"_a,
+      "beta_weight"_a,
+      "beta_scales"_a,
+      "decay_weight"_a,
+      "decay_scales"_a,
+      "conv_state"_a,
+      "conv_weight"_a,
+      "a_log"_a,
+      "dt_bias"_a,
+      "recurrent_state"_a,
+      "gdn_norm_weight"_a,
+      "gdn_out_weight"_a,
+      "gdn_out_scales"_a,
+      "pending_output"_a = nb::none(),
+      "pending_injection"_a = nb::none(),
+      "eps"_a = 1e-6f,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Run the fixed one-token Qwen pre-router layer envelope through one
+        Metal command encoder. Router selection and experts remain separate.
+      )");
+
+  m.def(
+      "qwen4_router_topk_fused_exact",
+      &mlx_kquant::qwen4_router_topk_fused_exact,
+      "logits"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Apply the fixed 512-expert Qwen softmax and stable top-10 router in one
+        exact Metal dispatch.
+      )");
+
+  m.def(
+      "qwen4_qsa_select_gather_k4v4_flat",
+      &mlx_kquant::qwen4_qsa_select_gather_k4v4,
+      "scores"_a,
+      "records"_a,
+      "exact_sink_keys"_a,
+      "exact_sink_values"_a,
+      "exact_tail_keys"_a,
+      "exact_tail_values"_a,
+      "pending_keys"_a,
+      "pending_values"_a,
+      "visible_count"_a,
+      "frontier"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Run stable QSA block selection and exact mutable K4/V4 row gathering
+        through one Metal command encoder. Cache state is not modified.
+      )");
+
+  m.def(
+      "qwen4_qsa_project_rope_q6",
+      &mlx_kquant::qwen4_qsa_project_rope_q6,
+      "hidden"_a,
+      "index_weight"_a,
+      "index_scales"_a,
+      "query_weight"_a,
+      "query_scales"_a,
+      "key_weight"_a,
+      "key_scales"_a,
+      "value_weight"_a,
+      "value_scales"_a,
+      "index_query_norm_weight"_a,
+      "query_norm_weight"_a,
+      "key_norm_weight"_a,
+      "rope_cosine"_a,
+      "rope_sine"_a,
+      "position_ids"_a,
+      "eps"_a = 1e-6f,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Run the fixed Q6_K QSA projection, normalization, and shared partial
+        RoPE boundary for one decode token.
+      )");
+
+  m.def(
       "sdpa_vector",
       &mlx_kquant::sdpa_vector,
       "q"_a,

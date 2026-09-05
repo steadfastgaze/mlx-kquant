@@ -82,9 +82,7 @@ def _spec_arrays(spec, rng):
 def _exact_equal(a: mx.array, b: mx.array) -> bool:
     """Bitwise equality for f16/bf16/f32 outputs (the f32 cast is lossless)."""
     return bool(
-        np.array_equal(
-            np.array(a.astype(mx.float32)), np.array(b.astype(mx.float32))
-        )
+        np.array_equal(np.array(a.astype(mx.float32)), np.array(b.astype(mx.float32)))
     )
 
 
@@ -199,8 +197,7 @@ def _build_combined_experts(codec):
         rng = np.random.default_rng(3)
         imat = None
         if codec in REQ_IMAT:
-            imat = mx.array(
-                (np.abs(rng.standard_normal(K)) + 0.1).astype(np.float32))
+            imat = mx.array((np.abs(rng.standard_normal(K)) + 0.1).astype(np.float32))
         scales = mx.zeros((1,), dtype=mx.uint8)
         wq_list = []
         deq_list = []
@@ -211,8 +208,8 @@ def _build_combined_experts(codec):
             wq_np = np.ascontiguousarray(np.array(wq).astype(np.uint8))
             wq_list.append(wq_np)
             deq_list.append(
-                np.array(
-                    kq.dequantize(mx.array(wq_np), scales, codec, mx.float32)))
+                np.array(kq.dequantize(mx.array(wq_np), scales, codec, mx.float32))
+            )
         _COMBINED_EXPERTS_CACHE[codec] = (np.stack(wq_list), deq_list)
     wq_stack, deq_list = _COMBINED_EXPERTS_CACHE[codec]
     return mx.array(wq_stack), deq_list
@@ -231,8 +228,7 @@ def _swiglu_f32(combined_f32, limit):
 
 
 @pytest.mark.parametrize("codec", CODECS)
-@pytest.mark.parametrize(
-    "case", ["ragged", "single_row_segments", "expert_gaps"])
+@pytest.mark.parametrize("case", ["ragged", "single_row_segments", "expert_gaps"])
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
 def test_gather_qmm_sorted_swiglu_matches_unfused(codec, case, dtype):
     """Fused output matches gather_qmm_sorted on the combined stack followed
@@ -254,15 +250,14 @@ def test_gather_qmm_sorted_swiglu_matches_unfused(codec, case, dtype):
     rtol, atol = SWIGLU_TOLS[dtype]
 
     for limit in (SWIGLU_LIMIT_ACTIVE, SWIGLU_LIMIT_OFF):
-        got = kq.gather_qmm_sorted_swiglu(
-            x, w, scales, codec, ids, N, limit)
+        got = kq.gather_qmm_sorted_swiglu(x, w, scales, codec, ids, N, limit)
         mx.eval(got)
         assert got.dtype == dtype
         assert got.shape == (S, N)
 
         clips = bool(
-            ((comb_f32[:, :N] > limit)
-             | (np.abs(comb_f32[:, N:]) > limit)).any())
+            ((comb_f32[:, :N] > limit) | (np.abs(comb_f32[:, N:]) > limit)).any()
+        )
         if limit == SWIGLU_LIMIT_ACTIVE:
             assert clips, f"{codec} {case}: active limit clipped nothing"
         else:
@@ -292,15 +287,15 @@ def test_gather_qmm_sorted_swiglu_matches_dq_f32_reference(codec):
     x = mx.array(x_np)  # float32
 
     got = kq.gather_qmm_sorted_swiglu(
-        x, w, scales, codec, mx.array(ids_np), N, SWIGLU_LIMIT_ACTIVE)
+        x, w, scales, codec, mx.array(ids_np), N, SWIGLU_LIMIT_ACTIVE
+    )
     mx.eval(got)
     assert got.dtype == mx.float32
     g = np.array(got)
 
     comb = np.zeros((S, 2 * N), dtype=np.float32)
     for expert, start, count in seg_np:
-        comb[start : start + count] = (
-            x_np[start : start + count] @ deq[expert].T)
+        comb[start : start + count] = x_np[start : start + count] @ deq[expert].T
     ref = _swiglu_f32(comb, SWIGLU_LIMIT_ACTIVE)
 
     diff = np.abs(g - ref)
@@ -342,7 +337,8 @@ def test_gather_qmm_sorted_swiglu_deep_negative_gate_is_zero():
     for dtype in (mx.float16, mx.bfloat16, mx.float32):
         for limit in (0.0, SWIGLU_LIMIT_OFF):
             got = kq.gather_qmm_sorted_swiglu(
-                mx.array(x_np).astype(dtype), w, scales, "q2_k", ids, N, limit)
+                mx.array(x_np).astype(dtype), w, scales, "q2_k", ids, N, limit
+            )
             mx.eval(got)
             out = np.array(got.astype(mx.float32))
             assert not np.isnan(out).any(), f"{dtype} limit={limit}: NaN"
@@ -367,7 +363,8 @@ def test_gather_qmm_sorted_swiglu_rejects_bad_gate_out():
         kq.gather_qmm_sorted_swiglu(x, w, scales, "q2_k", ids, 0, 0.2)
     with pytest.raises(ValueError):
         kq.gather_qmm_sorted_swiglu(
-            x, w, scales, "q2_k", ids, N // 2, 0.2, transpose=False)
+            x, w, scales, "q2_k", ids, N // 2, 0.2, transpose=False
+        )
 
 
 def test_gather_qmm_sorted_swiglu_rejects_bad_ids():
@@ -382,10 +379,12 @@ def test_gather_qmm_sorted_swiglu_rejects_bad_ids():
     scales = mx.zeros((1,), dtype=mx.uint8)
     with pytest.raises(ValueError):
         kq.gather_qmm_sorted_swiglu(
-            x, w, scales, "q2_k", mx.array(np.zeros(3, dtype=np.int32)), N, 0.2)
+            x, w, scales, "q2_k", mx.array(np.zeros(3, dtype=np.int32)), N, 0.2
+        )
     with pytest.raises(ValueError):
         kq.gather_qmm_sorted_swiglu(
-            x, w, scales, "q2_k", mx.array(np.zeros(4, dtype=np.uint32)), N, 0.2)
+            x, w, scales, "q2_k", mx.array(np.zeros(4, dtype=np.uint32)), N, 0.2
+        )
 
 
 def test_gather_qmm_sorted_rejects_bad_ids():
@@ -488,15 +487,12 @@ def _dr_tile_hashes(tile):
     return proc.stdout
 
 
-@pytest.mark.parametrize(
-    "tile", ["t48x128x16dr", "t48x128x16dr2", "t48x64x16dr"]
-)
+@pytest.mark.parametrize("tile", ["t48x128x16dr", "t48x128x16dr2", "t48x64x16dr"])
 def test_gather_qmm_sorted_devr_bit_identical(tile):
     if mx.default_device() == mx.cpu:
         pytest.skip("register-direct opt-in is a GPU kernel path")
     default = _dr_tile_hashes(None)
     got = _dr_tile_hashes(tile)
     assert got == default, (
-        f"{tile} output hashes diverge from the default tile:\n"
-        f"{got}\nvs\n{default}"
+        f"{tile} output hashes diverge from the default tile:\n{got}\nvs\n{default}"
     )

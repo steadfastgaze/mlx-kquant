@@ -14,6 +14,16 @@ Current API:
     DeepSeek-V4 hyper-connection post recombination fused into its epilogue.
   * ``quantized_matmul_qmv_add_hc_post`` - fixed-geometry shared-FFN Q8_0
     matvec with routed-add and DeepSeek-V4 hC-post fused into its epilogue.
+  * ``qwen4_hc_norm`` / ``qwen4_hc_front`` / ``qwen4_hc_epilogue`` -
+    fixed-geometry Qwen gated-residual decode stages.
+  * ``qwen4_gdn_prepare`` / ``qwen4_gdn_norm_gate`` - fixed-geometry Qwen
+    gated-delta recurrence boundaries.
+  * ``qwen4_gdn_prerouter_q6`` - fixed one-token Qwen pre-router envelope.
+  * ``qwen4_router_topk_fused_exact`` - exact 512-expert stable top-10 router.
+  * ``qwen4_qsa_project_rope_q6`` - fixed QSA projection and partial-RoPE
+    boundary.
+  * ``qwen4_qsa_select_gather_k4v4`` - stable QSA selection and mutable K4/V4
+    row reconstruction.
   * ``gather_qmm`` - mixture-of-experts gathered quantized matmul.
   * ``gather_qmm_segments`` - descriptor-driven segmented MoE quantized GEMM.
   * ``gather_qmm_sorted`` - segmented MoE quantized GEMM over device-sorted
@@ -61,6 +71,14 @@ from ._ext import (  # noqa: F401
     quantized_matmul_qmv_add_hc_post,
     quantized_matmul_qmv_bias,
     quantized_matmul_qmv_hc_post,
+    qwen4_gdn_norm_gate,
+    qwen4_gdn_prepare,
+    qwen4_gdn_prerouter_q6,
+    qwen4_hc_epilogue,
+    qwen4_hc_front,
+    qwen4_hc_norm,
+    qwen4_qsa_project_rope_q6,
+    qwen4_router_topk_fused_exact,
     rmsnorm2_add,
     rmsnorm_multi3,
     sdpa_decode_gqa,
@@ -73,9 +91,47 @@ from ._ext import (  # noqa: F401
     verify_zero_copy_views,
     zero_copy_view_count,
 )
+from ._ext import (
+    qwen4_qsa_select_gather_k4v4_flat as _qwen4_qsa_select_gather_k4v4_flat,
+)
 from ._version import __version__
 
 HAS_SDPA_DECODE_Q8_DIMENSION_PARALLEL_MERGE = True
+
+
+def qwen4_qsa_select_gather_k4v4(
+    scores,
+    records,
+    exact_sink_keys,
+    exact_sink_values,
+    exact_tail_keys,
+    exact_tail_values,
+    pending_keys,
+    pending_values,
+    *,
+    visible_count,
+    frontier,
+    stream=None,
+):
+    """Select and gather one fixed-geometry Qwen K4/V4 decode step."""
+    selected, valid, flat_keys, flat_values = _qwen4_qsa_select_gather_k4v4_flat(
+        scores,
+        records,
+        exact_sink_keys,
+        exact_sink_values,
+        exact_tail_keys,
+        exact_tail_values,
+        pending_keys,
+        pending_values,
+        visible_count,
+        frontier,
+        stream=stream,
+    )
+    provider_shape = (1, 1, 2051, 2, 256)
+    keys = flat_keys.reshape(provider_shape).transpose(0, 1, 3, 2, 4)
+    values = flat_values.reshape(provider_shape).transpose(0, 1, 3, 2, 4)
+    return selected, valid, keys, values
+
 
 __all__ = [
     "HAS_SDPA_DECODE_Q8_DIMENSION_PARALLEL_MERGE",
@@ -106,6 +162,15 @@ __all__ = [
     "quantized_matmul_qmv_add_hc_post",
     "quantized_matmul_qmv_bias",
     "quantized_matmul_qmv_hc_post",
+    "qwen4_gdn_norm_gate",
+    "qwen4_gdn_prepare",
+    "qwen4_gdn_prerouter_q6",
+    "qwen4_hc_epilogue",
+    "qwen4_hc_front",
+    "qwen4_hc_norm",
+    "qwen4_qsa_project_rope_q6",
+    "qwen4_qsa_select_gather_k4v4",
+    "qwen4_router_topk_fused_exact",
     "rmsnorm2_add",
     "rmsnorm_multi3",
     "sdpa_decode_gqa",

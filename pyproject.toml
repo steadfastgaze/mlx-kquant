@@ -47,7 +47,7 @@ dependencies = ["mlx==0.31.2"]
 # transformers<5.13: 5.13.0 rejects mlx-lm 0.31.3's string-key
 # AutoTokenizer.register at import; lift when a fixed mlx-lm ships.
 tools = ["mlx-lm>=0.27", "transformers<5.13", "gguf", "numpy"]
-dev = ["pytest", "ruff", "numpy", "gguf"]
+dev = ["pytest", "ruff", "numpy", "gguf", "mlx-lm>=0.27"]
 
 [project.scripts]
 mlx-kquant = "mlx_kquant.cli:main"

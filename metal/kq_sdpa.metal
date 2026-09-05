@@ -6,22 +6,27 @@
 #include "mlx/backend/metal/kernels/steel/attn/mma.h"
 #include "mlx/backend/metal/kernels/kq_sdpa.h"
 
-#define instantiate_kq_sdpa(type, D)                                  \
+#define instantiate_kq_sdpa(type, partial_type, D)                    \
   instantiate_kernel(                                                 \
       "kq_sdpa_vector_2pass_1_" #type "_" #D,                         \
       kq_sdpa_vector_2pass_1,                                         \
       type,                                                           \
+      partial_type,                                                   \
       D)                                                              \
   instantiate_kernel(                                                 \
       "kq_sdpa_vector_2pass_2_" #type "_" #D,                         \
       kq_sdpa_vector_2pass_2,                                         \
       type,                                                           \
+      partial_type,                                                   \
       D)
 
-instantiate_kq_sdpa(bfloat16_t, 256)
-instantiate_kq_sdpa(bfloat16_t, 512)
-instantiate_kq_sdpa(float16_t, 256)
-instantiate_kq_sdpa(float16_t, 512)
+// Float16 cannot represent every intermediate online-softmax partial at long
+// context. Bfloat16 retains its compact partial buffer because its exponent
+// range already covers those values.
+instantiate_kq_sdpa(bfloat16_t, bfloat16_t, 256)
+instantiate_kq_sdpa(bfloat16_t, bfloat16_t, 512)
+instantiate_kq_sdpa(float16_t, float, 256)
+instantiate_kq_sdpa(float16_t, float, 512)
 
 #define instantiate_kq_sdpa_gqa(type, D, C)                           \
   instantiate_kernel(                                                 \

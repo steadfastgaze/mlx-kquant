@@ -105,6 +105,11 @@ target_sources(
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_norm_fused.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_segments.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_decode_moe.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_qwen4_hc.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_qwen4_gdn.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_qwen4_gdn_prerouter.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_qwen4_qsa.cpp
+         ${CMAKE_CURRENT_LIST_DIR}/src/kquant_qwen4_router.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_gather.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_encode.cpp
          ${CMAKE_CURRENT_LIST_DIR}/src/kquant_gguf.cpp)
@@ -182,9 +187,18 @@ if(MLX_BUILD_METAL)
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_segments.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_decode_moe.metal
     ${CMAKE_CURRENT_LIST_DIR}/metal/kq_ds4_hc_post.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_qwen4_hc.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_qwen4_gdn.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_qwen4_qsa.metal
+    ${CMAKE_CURRENT_LIST_DIR}/metal/kq_qwen4_router.metal
     INCLUDE_DIRS
     ${CMAKE_CURRENT_LIST_DIR}/metal
     ${MLX_INCLUDE_DIRS}
+    DEPS
+    ${CMAKE_CURRENT_LIST_DIR}/metal/mlx/backend/metal/kernels/kq_qwen4_hc.h
+    ${CMAKE_CURRENT_LIST_DIR}/metal/mlx/backend/metal/kernels/kq_qwen4_gdn.h
+    ${CMAKE_CURRENT_LIST_DIR}/metal/mlx/backend/metal/kernels/kq_qwen4_qsa.h
+    ${CMAKE_CURRENT_LIST_DIR}/metal/mlx/backend/metal/kernels/kq_qwen4_router.h
     OUTPUT_DIRECTORY
     ${CMAKE_LIBRARY_OUTPUT_DIRECTORY})
 

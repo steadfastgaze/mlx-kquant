@@ -30,6 +30,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sets now match the contiguized-reference call bit-exactly.
 
 ### Added
+- Metal-only fixed-geometry Qwen Flash-Next decode primitives for the
+  four-branch gated residual path, GDN preparation and pre-router execution,
+  exact 512-expert routing, Q6_K QSA projection with partial RoPE, and stable
+  QSA selection with mutable K4/V4 cache-row reconstruction. Each operation
+  validates its complete shape and dtype contract before dispatch.
 - `sdpa_decode_q8(..., dimension_parallel_merge=True)` adds an opt-in
   dimension-parallel pass-two kernel for the 16-query-head, 2-KV-head,
   head-dim-256, split-128, tile-16 serving geometry at cache depths of at least
